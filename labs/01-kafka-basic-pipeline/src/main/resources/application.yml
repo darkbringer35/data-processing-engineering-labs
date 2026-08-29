@@ -1,0 +1,14 @@
+kafka:
+  bootstrap-servers: localhost:9092
+
+  producer:
+    key-serializer: org.apache.kafka.common.serialization.StringSerializer
+    value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  consumer:
+    group-id: lab01-consumer
+    key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    # 해당 consumer group에 저장된 offset이 없을 때 가장 오래된 record부터 읽는다.
+    # 이미 committed offset이 있다면 그 다음 위치부터 읽으므로 항상 처음부터 읽는 설정은 아니다.
+    auto-offset-reset: earliest
