@@ -11,16 +11,18 @@
 이번 Lab은 하나의 Kafka Topic과 여러 Producer/Consumer 애플리케이션으로 구성한다.
 - order-events Topic은 3개의 Partition으로 구성한다.
 - OrderEventProducer
-  - Message Key 유무에 따른 Partition 분배를 확인하기 위한 Producer
+  - Message Key 유무에 따른 Partition 분배를 확인한다.
   - Experiment 1, 2에서 사용한다.
 - OrderEventOrderingProducer
-  - 동일한 Message Key를 가진 이벤트의 순서 보장을 확인하기 위한 Producer
+  - 동일한 Message Key를 가진 이벤트의 Partition 내부 순서 보장을 확인한다.
   - Experiment 3에서 사용한다.
+- OrderEventHotKeyProducer
+  - 특정 Message Key에 트래픽을 집중시켜 Hot Partition 발생 여부를 확인한다.
+  - Experiment 4에서 사용한다.
 - OrderEventConsumer
-  - order-events Topic을 구독한다.
-  - 수신한 Record의 Partition, Offset, Key, Value를 출력한다.
+  - order-events Topic을 구독하고 수신한 Record의 Partition, Offset, Key, Value를 출력한다.
 - 주문 이벤트는 orderId를 포함하며, 실험에 따라 Message Key로 사용한다.
-각 Experiment는 Producer의 전송 방식과 이벤트 구성을 달리하여 Partition 분배와 순서 보장 동작을 비교한다.
+각 Experiment에서는 Message Key의 사용 방식과 이벤트 분포를 변경하며 Partition 분배, 순서 보장, 부하 편향을 비교한다.
 
 ## How to Run
 
@@ -93,12 +95,10 @@ Consumer 출력 일부
 - Message Key를 전달하지 않았기 때문에 Consumer에서 모든 Record의 key가 null로 확인되었다.
 - 각 Partition의 Offset은 독립적으로 관리되었다.
 - 동일한 orderId를 가진 이벤트가 서로 다른 Partition에 배치되는 것을 확인했다.
-- 3개의 Partition을 생성했지만 이번 실행에서는 Partition 0과 1만 사용되었고, Partition 2에는 Record가 배치되지 않았다.
-- 이벤트 수를 1000개로 늘리자 Partition 0,1,2가 전부 사용되는 것을 확인했다.
+- 100개의 Record를 전송했을 때는 Partition 0과 1만 사용되었지만, 1000개로 늘리자 세 Partition이 모두 사용되었다.
 
 ### 해석 및 궁금증
 - Message Key를 지정하지 않으면 orderId는 Value 내부의 데이터일 뿐이므로 Partition 선택에 영향을 주지 않는다.
-    - 동일한 orderId를 가진 이벤트가 서로 다른 Partition에 배치되었으므로, 현재 구조에서는 동일 주문의 이벤트가 하나의 Partition에 배치된다는 보장이 없다.
 - 100개의 Record를 전송했을 때는 Partition 2가 전혀 사용되지 않았지만, 1000개의 Record를 전송했을 때는 Partition 2도 사용되었다.
     - 이를 통해 Key가 없는 Record가 단순한 RR 방식으로 모든 Partition에 균등하게 배치되는 것은 아니며, 짧은 실행 결과만으로 Partition 사용 분포를 일반화해서는 안 된다는 점을 확인했다.
 - Kafka Producer는 Key가 없는 Record를 전송할 때 batching 효율을 높이기 위해 sticky 방식으로 특정 Partition을 일정 기간 사용하는 것으로 보인다.
@@ -207,6 +207,87 @@ Consumer 출력
   - Producer에서는 Partition 1과 2의 Record가 서로 섞여 전송되었지만, Consumer 출력에서는 Partition 2의 Record가 먼저 출력되고 이후 Partition 1의 Record가 출력되었다.
 - 따라서 Entity 단위의 순서가 필요한 경우 해당 Entity의 식별자를 Message Key로 사용해 동일한 Partition에 배치하는 것이 중요하다.
 
+## Experiment 4. Observe Hot Partition With Skewed Keys
+
+### 목적
+- Message Key의 분포가 편향되어 있을 때 특정 Partition에 Record가 집중되는지 확인한다.
+- Partition Key 설계가 순서 보장뿐 아니라 Partition 간 처리 부하 분산에도 영향을 주는지 확인한다.
+- 특정 Key에 트래픽이 집중되는 Hot Key가 Hot Partition으로 이어질 수 있음을 확인한다.
+
+### 명령어
+
+Consumer를 실행한다.
+
+```bash
+./gradlew runConsumer
+./gradlew runHotKeyProducer
+```
+
+Producer는 전체 Record 중 대부분에 동일한 Message Key를 사용한다.
+
+```kotlin
+val orderId = if (index < 80) {
+    "hot-order"
+} else {
+    "order-${index % 10}"
+}
+```
+
+### 실제 출력
+
+Producer 출력 전반부
+
+![Producer hot partition first half](images/producer-hot-partition-first-half.png)
+
+Producer 출력 후반부
+
+![Producer hot partition second half](images/producer-hot-partition-second-half.png)
+
+Consumer 출력 전반부
+
+![Consumer hot partition first half](images/consumer-hot-partition-first-half.png)
+
+Consumer 출력 후반부
+
+![Consumer hot partition second half](images/consumer-hot-partition-second-half.png)
+
+Consumer에서도 `hot-order` Record가 모두 Partition 0에서 수신되는 것을 확인했다.
+
+실행 결과 전체 100개의 Record는 다음과 같이 분배되었다.
+
+```text
+Partition 0: 86
+Partition 1: 8
+Partition 2: 6
+```
+
+### 결과
+- hot-order를 Key로 사용한 80개의 Record는 모두 Partition 0에 배치되었다.
+- 나머지 Key들은 여러 Partition에 분산되었지만, 전체 Record의 대부분이 Partition 0에 집중되었다.
+- 전체 100개의 Record 중 86%가 Partition 0에 배치되는 강한 Partition 편향이 발생했다.
+- Experiment 2에서는 여러 orderId가 비교적 고르게 분산되었지만, 특정 Key에 트래픽이 집중되자 Partition 분포도 크게 편향되었다.
+- Partition 0에서는 hot-order 80건이 모두 처리된 이후에 같은 Partition으로 배치된 order-2, order-3, order-6 등의 Record가 처리되었다.
+- 반면 다른 Partition에 배치된 Record는 Partition 0의 처리 순서와 독립적으로 처리될 수 있었다.
+
+### 해석 및 궁금증
+- 동일한 Message Key는 항상 동일한 Partition에 배치되므로 특정 Key의 트래픽 비중이 지나치게 높으면 해당 Partition으로 부하가 집중된다.
+- 따라서 Partition Key의 cardinality가 높다는 것만으로 균등한 부하 분산이 보장되지는 않는다.
+  - Key 종류가 많더라도 특정 Key 하나가 전체 트래픽의 대부분을 차지하면 Hot Partition이 발생할 수 있다.
+- Hot Partition은 단순히 Partition별 Record 수를 불균형하게 만드는 것에서 끝나지 않았다.
+  - hot-order와 같은 Partition 0에 배치된 다른 주문들은 먼저 적재된 hot-order Record 뒤의 Offset을 가지므로, 앞선 Record들이 처리된 이후에야 처리될 수 있었다.
+  - 즉 특정 Hot Key의 트래픽이 한 Partition에 누적되면 같은 Partition을 공유하는 다른 Key의 처리 지연까지 유발할 수 있다.
+- 다른 Partition은 독립적으로 처리될 수 있으므로 이러한 지연은 Topic 전체를 순차적으로 막는 것이 아니라 Hot Partition 내부에서 발생한다.
+- Partition Key는 Entity 단위 순서 보장과 함께 실제 데이터의 Key 분포와 트래픽 편향까지 고려하여 설계해야 한다.
+
 ## Troubleshooting
+- Experiment 3에서 하나의 orderId 이벤트만 연속으로 전송할 경우 Partition 내부 순서 보장은 확인할 수 있지만, 결과가 지나치게 단순하게 보였다.
+- 실제 환경처럼 다른 이벤트가 섞인 상황에서도 동일한 Key의 상대적인 순서가 유지되는지 확인하기 위해 noise-* 이벤트를 추가했다.
 
 ## Key Takeaways
+- Kafka의 Offset과 Ordering은 Partition 단위로 관리된다.
+- Message Key가 없으면 Value 내부의 Entity 식별자는 Partition 선택에 영향을 주지 않는다.
+- Key가 없는 Record는 단순 RR 방식이 아니라 Sticky 방식으로 배치될 수 있다.
+- 동일한 Message Key는 동일한 Partition에 배치되므로 Entity 단위의 순서를 유지하는 데 활용할 수 있다.
+- 서로 다른 Key를 여러 Partition에 분산시켜 Entity 단위의 순서 보장과 병렬 처리를 함께 활용할 수 있다.
+- 특정 Key에 트래픽이 집중되면 Hot Partition이 발생하고, 같은 Partition을 공유하는 다른 Key의 처리에도 영향을 줄 수 있다.
+- 따라서 Partition Key는 순서 보장 범위뿐 아니라 Key cardinality와 실제 트래픽 분포까지 고려해 설계해야 한다.
