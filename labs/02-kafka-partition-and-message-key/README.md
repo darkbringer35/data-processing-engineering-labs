@@ -98,6 +98,58 @@ Consumer 출력 일부
   - 실제로 Record가 Partition 사이에 고르게 섞여 배치되지 않고, 한 Partition에 연속적으로 생성된 뒤 다른 Partition으로 이동하는 패턴이 관찰되었다.
 - 다음 실험에서는 orderId를 Message Key로 지정하고, 동일한 Key를 가진 Record가 항상 동일한 Partition으로 전달되는지 확인한다.
 
+## Experiment 2. Produce Records With Order ID Key
+### 목적
+- orderId를 Message Key로 지정했을 때 동일한 주문의 이벤트가 같은 Partition에 배치되는지 확인한다.
+- 이를 통해 Message Key가 Partition 선택에 어떤 영향을 주는지 확인한다.
+
+### 명령어
+```bash
+./gradlew runConsumer
+./gradlew runProducer
+```
+
+Producer는 orderId를 Message Key로 지정하여 주문 이벤트를 전송한다.
+```kotlin
+ProducerRecord(
+  "order-events",
+  event.orderId,
+  json
+)
+```
+### 실제 출력
+
+Consumer 출력 일부
+
+![Consumer records with order ID key](images/consumer-records-with-order-id-key.png)
+
+실행 결과 Message Key와 Partition의 관계는 다음과 같았다.
+
+```text
+order-1  -> partition 1
+order-2  -> partition 0
+order-3  -> partition 0
+order-4  -> partition 2
+order-5  -> partition 2
+order-6  -> partition 0
+order-7  -> partition 1
+order-8  -> partition 2
+order-9  -> partition 1
+order-10 -> partition 0
+```
+
+### 결과
+- Consumer에서 Message Key가 실제 orderId 값으로 전달되는 것을 확인했다.
+- 동일한 orderId를 가진 Record는 반복해서 전송해도 항상 동일한 Partition에 배치되었다.
+- 서로 다른 Message Key라도 동일한 Partition에 배치될 수 있었다.
+- 서로 다른 Message Key는 여러 Partition에 분산되었으며, 이번 실행에서는 10개의 Key가 각 Partition에 4개, 3개, 3개로 비교적 고르게 분배되었다.
+- 각 Partition의 Offset은 Experiment 1과 동일하게 독립적으로 증가했다.
+
+### 해석 및 궁금증
+- orderId를 Message Key로 지정하자 동일한 주문의 이벤트가 하나의 Partition으로 고정되었다.
+- Kafka는 Message Key를 기반으로 Partition을 결정하므로, 동일한 Key를 사용하는 Record는 동일한 Partition에 배치된다.
+- 이를 통해 비즈니스 Entity의 식별자를 Message Key로 사용할 경우 해당 Entity 단위의 이벤트를 하나의 Partition에 모을 수 있음을 확인했다.
+- 다음 실험에서는 동일한 orderId에 대해 순서가 있는 이벤트를 전송하고, 같은 Partition 내부에서 메시지 순서가 유지되는지 확인한다.
 
 ## Troubleshooting
 

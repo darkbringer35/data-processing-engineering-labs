@@ -24,7 +24,7 @@ fun main() {
         .registerModule(JavaTimeModule())
 
     KafkaProducer<String, String>(props).use { producer ->
-        repeat(1000) {
+        repeat(100) {
             val orderId = "order-${Random.nextInt(1, 11)}"
 
             val event = OrderEvent(
@@ -41,6 +41,7 @@ fun main() {
             val metadata = producer.send(
                 ProducerRecord(
                     "order-events",
+                    event.orderId,
                     json
                 )
             ).get()
