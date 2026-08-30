@@ -42,3 +42,11 @@ tasks.register<JavaExec>("runConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("lab.kafka.OrderEventConsumerKt")
 }
+
+tasks.register<JavaExec>("runOrderingProducer") {
+    group = "application"
+    description = "Run Kafka ordering experiment producer"
+
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("lab.kafka.OrderEventOrderingProducerKt")
+}

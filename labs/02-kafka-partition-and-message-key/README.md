@@ -8,12 +8,19 @@
 - Partition Key 설계가 순서 보장과 병렬성에 어떤 영향을 주는지 이해한다.
 
 ## Implementation
-- `order-events` Topic은 3개의 Partition으로 구성한다.
-- Producer는 주문 이벤트를 생성해 Kafka에 전송한다.
-- Consumer는 `order-events` Topic을 구독하고 수신한 Record의 메타데이터를 출력한다.
-- 주문 이벤트는 `orderId`를 포함하며, 이후 실험에서 이 값을 Message Key로 사용한다.
-- Producer와 Consumer 출력에서 Partition과 Offset을 확인할 수 있도록 구성한다.
-- 실험 단계에 따라 Producer의 Message Key 사용 여부와 이벤트 생성 방식을 변경하며 Partition 분배와 순서 보장 동작을 비교한다.
+이번 Lab은 하나의 Kafka Topic과 여러 Producer/Consumer 애플리케이션으로 구성한다.
+- order-events Topic은 3개의 Partition으로 구성한다.
+- OrderEventProducer
+  - Message Key 유무에 따른 Partition 분배를 확인하기 위한 Producer
+  - Experiment 1, 2에서 사용한다.
+- OrderEventOrderingProducer
+  - 동일한 Message Key를 가진 이벤트의 순서 보장을 확인하기 위한 Producer
+  - Experiment 3에서 사용한다.
+- OrderEventConsumer
+  - order-events Topic을 구독한다.
+  - 수신한 Record의 Partition, Offset, Key, Value를 출력한다.
+- 주문 이벤트는 orderId를 포함하며, 실험에 따라 Message Key로 사용한다.
+각 Experiment는 Producer의 전송 방식과 이벤트 구성을 달리하여 Partition 분배와 순서 보장 동작을 비교한다.
 
 ## How to Run
 
@@ -150,6 +157,55 @@ order-10 -> partition 0
 - Kafka는 Message Key를 기반으로 Partition을 결정하므로, 동일한 Key를 사용하는 Record는 동일한 Partition에 배치된다.
 - 이를 통해 비즈니스 Entity의 식별자를 Message Key로 사용할 경우 해당 Entity 단위의 이벤트를 하나의 Partition에 모을 수 있음을 확인했다.
 - 다음 실험에서는 동일한 orderId에 대해 순서가 있는 이벤트를 전송하고, 같은 Partition 내부에서 메시지 순서가 유지되는지 확인한다.
+
+## Experiment 3. Verify Ordering Within a Partition
+### 목적
+- 동일한 orderId를 Message Key로 사용하여 순서가 있는 주문 이벤트를 전송한다.
+- 동일한 Key의 이벤트가 같은 Partition에 배치되고, 해당 Partition 내부에서 전송 순서가 유지되는지 확인한다.
+- 이를 통해 Kafka의 순서 보장이 Topic 전체가 아닌 Partition 단위로 이루어진다는 것을 확인한다.
+
+### 명령어
+```bash
+./gradlew runConsumer
+./gradlew runOrderingProducer
+```
+OrderEventOrderingProducer에서는 하나의 주문에 대한 이벤트 사이에 별도의 noise 이벤트를 섞어 전송한다.
+
+```text
+val events = listOf(
+    OrderEvent(..., "order-1", EventType.ORDER_CREATED, ...),
+    OrderEvent(..., "noise-1", EventType.ORDER_CREATED, ...),
+    OrderEvent(..., "order-1", EventType.PAYMENT_REQUESTED, ...),
+    OrderEvent(..., "noise-2", EventType.PAYMENT_REQUESTED, ...),
+    OrderEvent(..., "order-1", EventType.PAYMENT_COMPLETED, ...),
+    OrderEvent(..., "noise-3", EventType.ORDER_COMPLETED, ...),
+    OrderEvent(..., "order-1", EventType.ORDER_COMPLETED, ...)
+)
+```
+### 실제 출력
+Producer 출력
+
+![Producer partition ordering](images/producer-partition-ordering.png)
+
+Consumer 출력
+
+![Consumer partition ordering](images/consumer-partition-ordering.png)
+
+### 결과
+- order-1의 모든 Record가 Partition 1에 배치되었다.
+- order-1의 이벤트는 `ORDER_CREATED → PAYMENT_REQUESTED → PAYMENT_COMPLETED → ORDER_COMPLETED` 순서를 유지했다.
+- noise-3도 Partition 1에 배치되어 order-1 이벤트 사이에 위치했지만, order-1 이벤트들의 상대적인 순서는 유지되었다.
+- Producer의 전체 전송 순서와 Consumer의 전체 출력 순서는 동일하지 않았다.
+- 각 Partition 내부에서는 Offset 순서대로 Record가 처리되는 것을 확인했다.
+
+### 해석 및 궁금증
+- Kafka의 순서 보장은 Message Key 자체에 대한 보장이 아니라, 동일한 Key가 같은 Partition으로 전달되고 해당 Partition 내부의 Record 순서가 유지되는 구조를 통해 얻어진다.
+- 같은 Partition에는 서로 다른 Key의 Record가 함께 존재할 수 있다.
+  - 실제로 noise-3가 order-1과 같은 Partition 1에 배치되어 Offset 310을 차지했다.
+  - 그럼에도 order-1 이벤트의 상대적인 순서는 유지되었다.
+- 여러 Partition에 걸친 Record의 전역적인 순서는 보장되지 않는다.
+  - Producer에서는 Partition 1과 2의 Record가 서로 섞여 전송되었지만, Consumer 출력에서는 Partition 2의 Record가 먼저 출력되고 이후 Partition 1의 Record가 출력되었다.
+- 따라서 Entity 단위의 순서가 필요한 경우 해당 Entity의 식별자를 Message Key로 사용해 동일한 Partition에 배치하는 것이 중요하다.
 
 ## Troubleshooting
 
