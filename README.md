@@ -28,8 +28,9 @@ OLAP, Data Quality, Recommendation Pipeline 등
 - 데이터 정합성과 처리 보장 방식 검증
 - 실제 비즈니스 요구사항에 맞는 데이터 파이프라인 설계
 
-## Lab
+## Learning Tracks
 
-| Lab | Topic | What I Learn |
+| Track | Focus | Labs |
 |---|---|---|
-| 01 | Kafka Basic Pipeline | Producer → Kafka → Consumer 기본 흐름과 offset/lag |
+| Kafka | 메시지 전달, Partition, Consumer Group, 처리 보장 | [Kafka Labs](kafka/README.md) |
+| Flink | Stateful Stream Processing, Event Time, 장애 복구 | [Flink Labs](flink/README.md) |
