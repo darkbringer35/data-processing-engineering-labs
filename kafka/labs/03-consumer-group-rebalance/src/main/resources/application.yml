@@ -1,0 +1,17 @@
+kafka:
+  bootstrap-servers: localhost:9092
+
+  topic:
+    name: order-events
+    partitions: 6
+    replication-factor: 1
+
+  producer:
+    key-serializer: org.apache.kafka.common.serialization.StringSerializer
+    value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  consumer:
+    group-id: lab03-order-processors
+    key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    auto-offset-reset: earliest
