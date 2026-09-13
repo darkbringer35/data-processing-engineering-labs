@@ -12,7 +12,7 @@
 
 이번 Lab은 하나의 Kafka Topic과 Producer, Consumer Group으로 구성한다.
 
-- `order-events` Topic은 6개의 Partition으로 구성한다.
+- `order-events` Topic은 기본적으로 6개의 Partition으로 구성하며, 실험에 따라 생성 명령에서 Partition 수를 지정할 수 있다.
 - `OrderEventProducer`
   - Lab 02와 동일하게 `orderId`를 Message Key로 사용해 주문 이벤트 100건을 전송한다.
 - `OrderEventConsumer`
@@ -22,7 +22,9 @@
   - 수신한 Record의 Partition, Offset, Key와 Value를 출력한다.
 - `KafkaAdmin`
   - Producer나 Consumer와 분리된 실행 진입점으로 구성한다.
-  - Topic 생성·조회와 Consumer Group 조회 명령을 제공한다.
+  - `create-topic [partitions]`, `describe-topic`, `describe-group` 명령을 제공한다.
+  - `create-topic`의 Partition 수를 생략하면 `application.yml`의 값을 사용하고, 양의 정수를 전달하면 해당 값으로 Topic을 생성한다.
+  - 각 명령에서 허용하지 않는 추가 인자는 실행 전에 거부한다.
   - AdminClient의 비동기 결과가 완료될 때까지 기다린 뒤 성공과 실패를 호출자에게 전달한다.
   - Producer 또는 Consumer 시작 과정에서 Topic을 암묵적으로 생성하지 않는다.
   - Kafka CLI는 AdminClient 결과를 독립적으로 검증하는 관찰 도구로 유지한다.
@@ -53,6 +55,12 @@ JVM AdminClient로 Topic을 준비하고, Kafka CLI는 결과를 교차 검증�
 ```bash
 ./gradlew runAdmin --args="create-topic"
 ./gradlew runAdmin --args="describe-topic"
+```
+
+`create-topic`에 Partition 수를 생략하면 `application.yml`에 설정한 6개를 사용한다. 다른 수가 필요한 실험에서는 양의 정수 하나를 추가한다.
+
+```bash
+./gradlew runAdmin --args="create-topic 3"
 ```
 
 Topic의 Partition 수를 확인한다.
@@ -225,7 +233,8 @@ Kafka CLI에서도 동일한 Member 한 개와 Partition 6개의 Assignment `(0,
 ```bash
 docker compose down
 docker compose up -d
-./gradlew runAdmin --args="create-topic"
+# Ex3 변경 반영
+./gradlew runAdmin --args="create-topic 6"
 
 ./gradlew runConsumer --args="c1"
 ./gradlew runConsumer --args="c2"
@@ -237,7 +246,8 @@ docker compose up -d
 ```bash
 docker compose down
 docker compose up -d
-./gradlew runAdmin --args="create-topic"
+# Ex3 변경 반영
+./gradlew runAdmin --args="create-topic 6"
 
 ./gradlew runConsumer --args="c1"
 ./gradlew runProducer --args="continuous"
@@ -325,6 +335,97 @@ c1만 보면 마지막 레코드부터 다음 레코드까지 약 649ms의 간�
 - Range Assignor의 eager 리밸런싱에서는 c1과 c2가 나중에도 유지할 파티션까지 일단 모두 반납한 후 다시 할당받았다. 실제 소유자가 바뀐 파티션은 컨슈머를 늘릴 때마다 3개였지만 `partitions_revoked` 콜백에는 그보다 많은 파티션이 포함되었다.
 - c2 합류 시 c1의 레코드 출력 간격은 약 649ms였지만 모든 컨슈머의 로그에서 레코드 출력이 끊긴 간격은 약 136ms였다. c1의 다음 레코드 자체가 늦게 생성되었으므로 두 값의 차이를 c1의 리밸런싱 지연으로 해석하지 않는다.
 - 어떤 조건이 리밸런싱과 처리 재개를 늦추는지는 이번 실험만으로 알 수 없다. 후속 실험에서 종료 방식, 타임아웃, 컨슈머와 파티션 수, 파티션 할당 전략, 리밸런싱 콜백의 작업 시간과 코디네이터까지의 네트워크 지연을 하나씩 바꾸며 비교해 보면 좋을 것 같다.
+
+## Experiment 3. Run More Consumers Than Partitions
+
+### 목적
+
+- 같은 컨슈머 그룹의 컨슈머를 파티션 수보다 하나 많게 되었을 때 각 컨슈머의 파티션 할당을 확인한다.
+- 파티션을 할당받지 못한 컨슈머가 레코드를 처리하는지 확인한다.
+- 컨슈머 수가 파티션 수를 초과한 뒤에도 처리에 참여하는 컨슈머 수가 늘어나는지 확인한다.
+
+### 명령어
+
+이전 실험의 프로세스와 데이터를 정리한 뒤 Kafka를 다시 시작한다. `application.yml`의 기본값은 변경하지 않고 `create-topic`의 인자로 파티션 수 3을 지정한다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 3"
+```
+
+서로 다른 Terminal에서 같은 `group.id`를 사용하는 컨슈머 4개를 순서대로 실행한다. 각 컨슈머의 할당 로그를 확인한 뒤 다음 컨슈머를 실행한다.
+
+```bash
+# Terminal 1
+./gradlew runConsumer --args="c1"
+
+# Terminal 2
+./gradlew runConsumer --args="c2"
+
+# Terminal 3
+./gradlew runConsumer --args="c3"
+
+# Terminal 4
+./gradlew runConsumer --args="c4"
+```
+
+다른 Terminal에서 레코드가 계속 유입되도록 프로듀서를 실행한다.
+
+```bash
+# Terminal 5
+./gradlew runProducer --args="continuous"
+```
+
+컨슈머 그룹이 안정된 뒤 AdminClient와 Kafka CLI로 모든 멤버의 할당을 각각 조회한다.
+
+```bash
+./gradlew runAdmin --args="describe-group"
+```
+
+### 실제 출력
+
+프로듀서는 파티션 0, 1, 2에 레코드를 전송했다.
+
+![3개 파티션에 레코드를 전송한 프로듀서](images/producer-records-three-partitions.png)
+
+c1은 처음에 파티션 0, 1, 2를 모두 할당받았다. c2와 c3가 합류하면서 담당 파티션이 줄었고, c4 합류 후에도 파티션 0을 다시 할당받아 레코드를 처리했다.
+
+![c1의 리밸런싱과 파티션 0 처리](images/consumer-c1-rebalance-and-partition-0-processing.png)
+
+c2는 처음에 파티션 2를 할당받았고 c3 합류 후 파티션 1로 변경되었다. c4가 합류할 때 파티션 1을 반납한 뒤 같은 파티션을 다시 할당받아 레코드를 처리했다.
+
+![c2의 리밸런싱과 파티션 1 처리](images/consumer-c2-rebalance-and-partition-1-processing.png)
+
+c3는 파티션 2를 할당받았다. c4가 합류할 때 파티션 2를 반납한 뒤 같은 파티션을 다시 할당받아 레코드를 처리했다.
+
+![c3의 리밸런싱과 파티션 2 처리](images/consumer-c3-rebalance-and-partition-2-processing.png)
+
+c4는 컨슈머 그룹에 합류했지만 `partitions_assigned`의 파티션 목록이 비어 있었다. 프로세스는 종료되지 않고 계속 실행 중이었으며, 캡처에는 레코드 처리 로그가 출력되지 않았다.
+
+![c4의 빈 파티션 할당](images/consumer-c4-empty-assignment.png)
+
+AdminClient 조회에서 컨슈머 그룹은 `Stable`, 파티션 할당 전략은 `range`, 멤버 수는 4로 나타났다. c1, c2, c3에는 각각 파티션 0, 1, 2가 할당되었고 c4의 파티션 목록은 비어 있었다.
+
+![멤버 4개인 컨슈머 그룹을 조회한 AdminClient](images/consumer-group-four-members-by-admin-client.png)
+
+### 결과
+
+컨슈머 그룹이 `Stable`인 AdminClient 조회 시점과 각 컨슈머 캡처를 기준으로 기록했다.
+
+| 컨슈머 | 최종 할당 파티션 | 레코드 처리 로그 | 관찰 결과 |
+|---|---|---|---|
+| c1 | 0 | 있음 | 파티션 0 처리 |
+| c2 | 1 | 있음 | 파티션 1 처리 |
+| c3 | 2 | 있음 | 파티션 2 처리 |
+| c4 | 없음 | 없음 | 프로세스는 실행 중이지만 처리에는 참여하지 않음 |
+
+### 해석 및 궁금증
+
+- 3개 파티션은 c1, c2, c3에 하나씩 할당되었고 네 번째로 합류한 c4에는 파티션이 할당되지 않았다. 컨슈머가 3개에서 4개로 늘어도 레코드 처리에 참여한 컨슈머 수는 3개로 유지되었다.
+- c4는 파티션을 할당받지 못했지만 AdminClient에서 컨슈머 그룹의 멤버로 조회되었다. 따라서 파티션 할당이 비어 있다는 것과 컨슈머 그룹에 참여하지 않았다는 것은 다르다.
+- c4 프로세스는 빈 파티션 할당을 받은 뒤에도 실행 중이었다. 다만 현재 로그에는 `poll()` 호출 자체를 기록하지 않으므로 `poll()`이 계속 호출되는지는 캡처만으로 확인할 수 없다.
+- c4가 합류할 때 c1, c2, c3는 각각 담당하던 파티션을 반납한 뒤 같은 파티션을 다시 할당받았다. 최종 파티션 소유자는 바뀌지 않았지만 Range Assignor의 eager 리밸런싱은 발생했으므로, 파티션을 할당받지 못한 컨슈머를 추가하는 것도 비용이 없지는 않았다.
 
 ## Troubleshooting
 
