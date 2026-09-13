@@ -43,10 +43,36 @@ private fun describeTopic(admin: Admin, topicName: String) {
 }
 
 private fun describeConsumerGroup(admin: Admin, groupId: String) {
-    admin.describeConsumerGroups(listOf(groupId))
+    val description = admin.describeConsumerGroups(listOf(groupId))
         .all()
         .get()
-        .let { println(it) }
+        .getValue(groupId)
+
+    val coordinator = description.coordinator()
+
+    println("consumer-group:")
+    println("  groupId: ${description.groupId()}")
+    println("  state: ${description.state()}")
+    println("  assignor: ${description.partitionAssignor()}")
+    println("  coordinator: ${coordinator.id()}@${coordinator.host()}:${coordinator.port()}")
+    println("  memberCount: ${description.members().size}")
+    println("  members:")
+
+    description.members()
+        .sortedBy { it.clientId() }
+        .forEach { member ->
+            val partitions = member.assignment()
+                .topicPartitions()
+                .sortedWith(compareBy({ it.topic() }, { it.partition() }))
+                .joinToString(prefix = "[", postfix = "]") {
+                    "${it.topic()}-${it.partition()}"
+                }
+
+            println("    - clientId: ${member.clientId()}")
+            println("      memberId: ${member.consumerId()}")
+            println("      host: ${member.host()}")
+            println("      partitions: $partitions")
+        }
 }
 
 private fun printUsage() {
