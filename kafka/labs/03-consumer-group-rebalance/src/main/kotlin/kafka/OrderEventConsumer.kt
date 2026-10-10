@@ -2,9 +2,11 @@ package lab.kafka
 
 import lab.kafka.config.KafkaConfigLoader
 import org.apache.kafka.clients.consumer.KafkaConsumer
+import org.apache.kafka.common.errors.WakeupException
 import java.time.Duration
 import java.time.Instant
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicBoolean
 
 fun main(args: Array<String>) {
     val consumerId = args.singleOrNull() ?: error("Consumer ID is required.")
@@ -20,13 +22,30 @@ fun main(args: Array<String>) {
         put("auto.offset.reset", config.consumer.autoOffsetReset)
     }
 
-    KafkaConsumer<String, String>(props).use { consumer ->
+    val consumer = KafkaConsumer<String, String>(props)
+    val shutdownRequested = AtomicBoolean(false)
+    val consumerThread = Thread.currentThread()
+    val pid = ProcessHandle.current().pid()
+
+    val shutdownHook = Thread({
+        if (shutdownRequested.compareAndSet(false, true)) {
+            logLifecycle(consumerId, "shutdown_requested", "pid=$pid")
+        }
+
+        consumer.wakeup()
+        consumerThread.join()
+    }, "consumer-shutdown-$consumerId")
+
+    Runtime.getRuntime().addShutdownHook(shutdownHook)
+    logLifecycle(consumerId, "consumer_started", "pid=$pid")
+
+    try {
         consumer.subscribe(
             listOf(config.topic.name),
             RebalanceLoggingListener(consumerId)
         )
 
-        while (true) {
+        while (!shutdownRequested.get()) {
             val records = consumer.poll(Duration.ofSeconds(1))
 
             for (record in records) {
@@ -42,5 +61,24 @@ fun main(args: Array<String>) {
                 )
             }
         }
+    } catch (exception: WakeupException) {
+        if (!shutdownRequested.get()) {
+            throw exception
+        }
+    } finally {
+        logLifecycle(consumerId, "consumer_close_started")
+        consumer.close()
+        logLifecycle(consumerId, "consumer_close_completed")
     }
+}
+
+private fun logLifecycle(consumerId: String, event: String, detail: String? = null) {
+    println(
+        buildString {
+            append("timestamp=${Instant.now()} consumerId=$consumerId event=$event")
+            if (detail != null) {
+                append(" $detail")
+            }
+        }
+    )
 }

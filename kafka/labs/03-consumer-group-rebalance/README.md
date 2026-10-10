@@ -18,8 +18,11 @@
 - `OrderEventConsumer`
   - 모든 컨슈머는 기본적으로 `lab03-order-processors` 컨슈머 그룹에 참여한다.
   - 실행 인자로 받은 식별자를 `client.id`와 Record 로그에 사용한다.
+  - 시작할 때 실제 컨슈머 JVM의 PID를 출력한다.
   - `RebalanceLoggingListener`로 Assigned/Revoked Partition을 기록한다.
   - 수신한 Record의 Partition, Offset, Key와 Value를 출력한다.
+  - JVM 종료 요청을 받으면 shutdown hook에서 종료 상태를 기록하고 `consumer.wakeup()`으로 `poll()`을 중단한다.
+  - `WakeupException`이 종료 요청으로 발생했는지 확인한 뒤 컨슈머 실행 스레드의 `finally`에서 `consumer.close()`를 호출하며, Close 시작과 완료 시각을 기록한다.
 - `KafkaAdmin`
   - Producer나 Consumer와 분리된 실행 진입점으로 구성한다.
   - `create-topic [partitions]`, `describe-topic`, `describe-group` 명령을 제공한다.
@@ -427,6 +430,140 @@ AdminClient 조회에서 컨슈머 그룹은 `Stable`, 파티션 할당 전략�
 - c4 프로세스는 빈 파티션 할당을 받은 뒤에도 실행 중이었다. 다만 현재 로그에는 `poll()` 호출 자체를 기록하지 않으므로 `poll()`이 계속 호출되는지는 캡처만으로 확인할 수 없다.
 - c4가 합류할 때 c1, c2, c3는 각각 담당하던 파티션을 반납한 뒤 같은 파티션을 다시 할당받았다. 최종 파티션 소유자는 바뀌지 않았지만 Range Assignor의 eager 리밸런싱은 발생했으므로, 파티션을 할당받지 못한 컨슈머를 추가하는 것도 비용이 없지는 않았다.
 
+## Experiment 4. Graceful Close vs Abrupt Termination
+
+### 목적
+
+- 같은 조건에서 c2를 SIGTERM으로 정상 종료한 경우와 `kill -9`로 강제 종료한 경우를 각각 실행한다.
+- 종료 대상인 c2에서 종료 요청, 파티션 반납과 `consumer.close()` 시작·완료를 구분해 기록한다.
+- 남은 c1의 파티션 반납·할당 콜백 시각을 비교해 c2 종료부터 재할당까지 걸린 시간을 확인한다.
+- 종료 전후의 컨슈머 그룹 멤버 수와 파티션 할당을 AdminClient로 확인한다.
+
+### 명령어
+
+먼저 컨슈머가 시작될 때 PID를 출력하고, SIGTERM을 받으면 `poll()`을 중단한 뒤 컨슈머 실행 스레드에서 `consumer.close()`를 호출하도록 구현한다. c2에서는 종료 요청, 파티션 반납과 `close()` 시작·완료 시각을, c1에서는 파티션 반납·할당 시각을 로그로 남긴다.
+
+첫 번째 실행에서는 Kafka와 6개 파티션 토픽을 준비한다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+```
+
+서로 다른 터미널에서 c1, c2와 지속 프로듀서를 실행한다. 두 컨슈머의 최초 할당과 로그에 출력된 c2 PID를 확인한다.
+
+```bash
+# Terminal 1
+./gradlew runConsumer --args="c1"
+
+# Terminal 2
+./gradlew runConsumer --args="c2"
+
+# Terminal 3
+./gradlew runProducer --args="continuous"
+```
+
+컨슈머 그룹이 `Stable`인 상태를 조회한 뒤 c2에 SIGTERM을 보내고, c1의 재할당이 끝난 상태를 다시 조회한다.
+
+```bash
+./gradlew runAdmin --args="describe-group"
+kill -TERM <c2-pid>
+./gradlew runAdmin --args="describe-group"
+```
+
+첫 번째 실행의 로그를 보존한 뒤 모든 프로세스와 Kafka를 종료한다. 두 번째 실행에서는 Kafka와 토픽을 다시 만들고 c1, c2와 지속 프로듀서를 같은 순서로 실행한다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+
+./gradlew runConsumer --args="c1"
+./gradlew runConsumer --args="c2"
+./gradlew runProducer --args="continuous"
+```
+
+강제 종료 시각은 c2 내부에 남길 수 없으므로 외부 터미널에서 UTC 시각을 출력한 직후 c2에 SIGKILL을 보낸다. c1의 재할당이 끝나면 컨슈머 그룹을 다시 조회한다.
+
+```bash
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())' \
+  && kill -9 <c2-pid>
+./gradlew runAdmin --args="describe-group"
+```
+
+### 실제 출력
+
+SIGTERM 실행에서 c1은 처음 6개 파티션을 모두 할당받았고, c2가 합류한 뒤 파티션 0, 1, 2를 할당받았다.
+
+![SIGTERM 실행 전 c1의 파티션 할당](images/consumer-c1-assignment-before-sigterm.png)
+
+c2는 PID 5877로 시작했고 파티션 3, 4, 5를 할당받았다.
+
+![SIGTERM 실행 전 c2의 파티션 할당](images/consumer-c2-assignment-before-sigterm.png)
+
+종료 전 AdminClient 조회에서 그룹은 `Stable`, 멤버 수는 2였으며 c1과 c2가 파티션을 3개씩 나누어 가지고 있었다.
+
+![SIGTERM 실행 전 컨슈머 그룹](images/consumer-group-before-sigterm.png)
+
+c2는 SIGTERM 이후 종료 요청을 기록하고 `consumer.close()`를 시작했다. 파티션 3, 4, 5의 반납 콜백이 호출된 뒤 0.165994초 만에 Close가 완료되었다. Gradle은 시그널로 종료된 JavaExec 프로세스를 작업 실패로 표시했다.
+
+![SIGTERM 이후 c2의 정상 종료](images/consumer-c2-graceful-close-after-sigterm.png)
+
+c1은 파티션 0, 1, 2를 반납한 뒤 6개 파티션을 모두 다시 할당받았다. 캡처에는 리밸런싱 전 마지막 레코드와 리밸런싱 후 첫 레코드도 포함되어 있다.
+
+![SIGTERM 이후 c1의 파티션 재할당](images/consumer-c1-rebalance-after-sigterm.png)
+
+종료 후 AdminClient 조회에서 그룹은 `Stable`, 멤버 수는 1이었으며 c1이 6개 파티션을 모두 가지고 있었다.
+
+![SIGTERM 실행 후 컨슈머 그룹](images/consumer-group-after-sigterm.png)
+
+SIGKILL 실행에서는 외부 터미널에서 UTC 시각 `2026-10-10T11:37:12.495777+00:00`을 출력한 직후 PID 9247인 c2에 `kill -9`를 실행했다.
+
+![UTC 시각을 기록한 SIGKILL 명령](images/sigkill-command-with-utc-timestamp.png)
+
+c2에서는 마지막 레코드 처리 로그 직후 프로세스가 exit code 137로 종료되었다. SIGTERM 실행에서 확인한 종료 요청, 파티션 반납과 Close 시작·완료 로그는 남지 않았다.
+
+![SIGKILL 이후 c2의 강제 종료](images/consumer-c2-abrupt-termination-after-sigkill.png)
+
+c1은 SIGKILL 시각으로부터 약 44초 뒤 파티션 0, 1, 2를 반납하고 6개 파티션을 모두 다시 할당받았다. 캡처에는 리밸런싱 전 마지막 레코드와 리밸런싱 후 첫 레코드도 포함되어 있다.
+
+![SIGKILL 이후 c1의 파티션 재할당](images/consumer-c1-rebalance-after-sigkill.png)
+
+AdminClient 조회에서 종료 전에는 그룹이 `Stable`, 멤버 수가 2였고 c1과 c2가 파티션을 3개씩 나누어 가지고 있었다. 종료 후에는 그룹이 다시 `Stable`이 되었고, 남은 c1이 6개 파티션을 모두 가지고 있었다.
+
+![SIGKILL 실행 전후 컨슈머 그룹](images/consumer-group-before-and-after-sigkill.png)
+
+### 결과
+
+SIGTERM의 종료 기준은 c2의 `shutdown_requested`, SIGKILL의 종료 기준은 외부 터미널에 기록할 UTC 시각으로 삼는다. 종료 시점은 두 실행 모두 c1의 `partitions_assigned`로 맞춘다.
+
+| 종료 방식 | 종료 기준 시각 | c1 파티션 반납 시각 | c1 파티션 할당 시각 | 종료 기준→할당 간격 | c2에서 관찰한 마지막 이벤트 |
+|---|---|---|---|---:|---|
+| SIGTERM | 2026-10-10T10:22:57.380177Z | 2026-10-10T10:23:00.386960Z | 2026-10-10T10:23:00.393714Z | 3.013537초 | `consumer_close_completed` |
+| SIGKILL | 2026-10-10T11:37:12.495777Z | 2026-10-10T11:37:56.643790Z | 2026-10-10T11:37:56.650906Z | 44.155129초 | `processedDate` 2026-10-10T11:37:12.347093Z, 종료 로그 없음 |
+
+종료 전후 파티션 할당을 기록한다.
+
+| 종료 방식 | 시점 | c1 할당 파티션 | c2 할당 파티션 | 그룹 멤버 수 | 그룹 상태 |
+|---|---|---|---|---:|---|
+| SIGTERM | 종료 전 | 0, 1, 2 | 3, 4, 5 | 2 | Stable |
+| SIGTERM | 종료 후 | 0, 1, 2, 3, 4, 5 | - | 1 | Stable |
+| SIGKILL | 종료 전 | 0, 1, 2 | 3, 4, 5 | 2 | Stable |
+| SIGKILL | 종료 후 | 0, 1, 2, 3, 4, 5 | - | 1 | Stable |
+
+c1의 레코드 로그에서 관찰한 출력 간격은 리밸런싱 시간과 분리해 기록한다.
+
+| 종료 방식 | 리밸런싱 전 마지막 처리 시각 | 리밸런싱 후 첫 처리 시각 | 레코드 출력 간격 |
+|---|---|---|---:|
+| SIGTERM | 2026-10-10T10:22:59.914377Z | 2026-10-10T10:23:00.436466Z | 0.522089초 |
+| SIGKILL | 2026-10-10T11:37:56.158343Z | 2026-10-10T11:37:56.678010Z | 0.519667초 |
+
+### 해석 및 궁금증
+
+- SIGTERM에서는 c2가 `consumer.close()`를 실행하면서 파티션 반납과 Close 완료를 기록했고, 약 3.014초 뒤 c1의 재할당이 완료되었다. SIGKILL에서는 c2의 종료 로그 없이 프로세스가 끝났고, 기본 세션 타임아웃 45초에 가까운 약 44.155초 뒤 c1의 재할당이 완료되었다.
+- 이외의 작업은 차이가 없었던 것으로 확인된다.
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임
@@ -446,5 +583,12 @@ AdminClient 조회에서 컨슈머 그룹은 `Stable`, 파티션 할당 전략�
 - 영향: Kafka Admin 요청과 Topic/Consumer Group 조회 자체는 정상적으로 완료되었지만 Kafka Client 내부 로그는 출력되지 않는다.
 - 대응: Experiment 1에서는 경고와 기능 실패를 구분해 기록하고, 현재 실험에 필요하지 않은 Logging Dependency는 미리 추가하지 않는다.
 - 재발 방지: 이후 Kafka Client 내부 로그가 실제 관찰 대상이 되는 Experiment에서 SLF4J API 버전과 호환되는 구현체를 명시적으로 선택한다.
+
+### Experiment 4의 SIGTERM 실행에서 정상 종료 로그 없이 세션 타임아웃 뒤 재할당됨
+
+- 증상: `kill -TERM` 이후 c2의 종료 요청과 `consumer.close()` 로그가 없었고, c1은 약 45초 뒤 파티션을 재할당받았다.
+- 원인: Experiment 4의 첫 번째 실행에서 `ps -ef | grep c2`에 표시된 Gradle Wrapper PID를 종료했다. 실제 c2는 Gradle이 실행한 별도의 `OrderEventConsumerKt c2` JVM이었다.
+- 해결: 컨슈머가 시작할 때 자신의 PID를 출력하도록 하고 그 PID에 SIGTERM을 보낸다. SIGTERM 수신 시 `poll()`을 중단하고 컨슈머 실행 스레드에서 `consumer.close()`를 호출하는 종료 처리도 먼저 구현한다.
+- 재발 방지: 종료 전에 PID의 명령이 `lab.kafka.OrderEventConsumerKt c2`인지 확인하며, Gradle Wrapper나 Gradle Daemon PID를 사용하지 않는다.
 
 ## Key Takeaways
