@@ -26,5 +26,7 @@ data class ConsumerConfig(
     val groupId: String,
     val keyDeserializer: String,
     val valueDeserializer: String,
-    val autoOffsetReset: String
+    val autoOffsetReset: String,
+    val heartbeatIntervalMs: Int,
+    val sessionTimeoutMs: Int,
 )

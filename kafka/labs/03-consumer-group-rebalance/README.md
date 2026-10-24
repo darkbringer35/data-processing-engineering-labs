@@ -564,6 +564,350 @@ c1의 레코드 로그에서 관찰한 출력 간격은 리밸런싱 시간과 �
 - SIGTERM에서는 c2가 `consumer.close()`를 실행하면서 파티션 반납과 Close 완료를 기록했고, 약 3.014초 뒤 c1의 재할당이 완료되었다. SIGKILL에서는 c2의 종료 로그 없이 프로세스가 끝났고, 기본 세션 타임아웃 45초에 가까운 약 44.155초 뒤 c1의 재할당이 완료되었다.
 - 이외의 작업은 차이가 없었던 것으로 확인된다.
 
+## Experiment 5. Heartbeat, Session Timeout and Network Failure
+
+### 목적
+
+- `heartbeat.interval.ms`를 2초로 고정하고 `session.timeout.ms`를 6초와 15초로 바꿔 c2를 SIGKILL로 종료한다.
+- 장애 주입부터 남은 c1이 파티션 반납과 재할당을 관찰할 때까지 걸린 시간을 구분해 측정한다.
+- Heartbeat 주기와 Session Timeout이 장애 감지 과정에서 서로 다른 역할을 하는지 확인한다.
+- 후속 실행에서 Network 단절을 같은 기준으로 비교한다.
+
+### 명령어
+
+첫 번째 실행에서는 Consumer 설정에 Heartbeat 2초와 Session Timeout 6초를 적용했다.
+
+```yaml
+kafka:
+  consumer:
+    heartbeat-interval-ms: 2000
+    session-timeout-ms: 6000
+```
+
+Kafka와 6개 파티션 토픽을 준비했다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+```
+
+서로 다른 터미널에서 c1, c2와 지속 프로듀서를 실행했다.
+
+```bash
+# Terminal 1
+./gradlew runConsumer --args="c1"
+
+# Terminal 2
+./gradlew runConsumer --args="c2"
+
+# Terminal 3
+./gradlew runProducer --args="continuous"
+```
+
+두 컨슈머의 파티션 할당이 끝난 뒤 컨슈머 그룹이 `Stable`인지 확인했다.
+
+```bash
+./gradlew runAdmin --args="describe-group"
+```
+
+외부 터미널에서 UTC 시각을 출력한 직후 c2의 Java Process에 SIGKILL을 보냈다. c1의 재할당이 끝난 뒤 컨슈머 그룹을 다시 조회했다.
+
+```bash
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())' \
+  && kill -9 83365
+
+./gradlew runAdmin --args="describe-group"
+```
+
+첫 번째 실행의 로그를 보존한 뒤 모든 프로세스와 Kafka를 종료했다. 두 번째 실행에서는 Heartbeat를 2초로 유지하고 Session Timeout만 15초로 변경했다.
+
+```yaml
+kafka:
+  consumer:
+    heartbeat-interval-ms: 2000
+    session-timeout-ms: 15000
+```
+
+Kafka와 토픽을 다시 만들고 c1, c2와 지속 프로듀서를 같은 순서로 실행했다. 컨슈머 그룹이 `Stable`이고 멤버가 2개인 상태를 확인한 뒤 c2에 SIGKILL을 보냈다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+
+./gradlew runConsumer --args="c1"
+./gradlew runConsumer --args="c2"
+./gradlew runProducer --args="continuous"
+
+./gradlew runAdmin --args="describe-group"
+
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())' \
+  && kill -9 84579
+
+./gradlew runAdmin --args="describe-group"
+```
+
+Toxiproxy는 클라이언트와 서버 사이에서 TCP 연결을 전달하면서 연결 차단, 지연과 대역폭 제한 같은 Network 장애를 주입하는 도구다. Kafka 구성 요소는 아니며 이번 Lab에서 c2의 연결만 선택적으로 끊기 위한 실험 도구로 사용한다.
+
+Kafka 컨테이너나 공통 Docker Network를 중단하면 c1, Producer와 AdminClient도 함께 영향을 받는다. c2 프로세스를 실행한 상태로 유지하면서 c2와 Kafka 사이의 통신만 차단하기 위해 Kafka에 직접 연결하는 `DIRECT` listener와 Toxiproxy를 통과하는 `PROXY` listener를 분리했다. Toxiproxy의 제어 API와 c2 접속 포트는 호스트의 loopback interface에만 공개했다.
+
+```yaml
+services:
+  kafka:
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_LISTENERS: DIRECT://:9092,PROXY://:29093,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: DIRECT://localhost:9092,PROXY://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: DIRECT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,DIRECT:PLAINTEXT,PROXY:PLAINTEXT
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    ports:
+      - "127.0.0.1:8474:8474"
+      - "127.0.0.1:29092:29092"
+    depends_on:
+      - kafka
+```
+
+두 컨슈머의 연결 경로는 다음과 같이 분리한다.
+
+```text
+c1 -> localhost:9092 -> Kafka DIRECT listener
+c2 -> localhost:29092 -> Toxiproxy -> kafka:29093 -> Kafka PROXY listener
+```
+
+Network 단절 실행 전 Compose 설정을 검증하고, Toxiproxy에 c2 전용 proxy를 생성한다. `listen`은 c2가 접속하는 Toxiproxy 포트이고 `upstream`은 Docker Network 안에서 Toxiproxy가 접속하는 Kafka service와 포트다.
+
+```bash
+docker compose config
+docker compose down
+docker compose up -d
+
+curl -fsS \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "kafka-c2",
+    "listen": "0.0.0.0:29092",
+    "upstream": "kafka:29093",
+    "enabled": true
+  }' \
+  http://localhost:8474/proxies
+
+curl -fsS http://localhost:8474/proxies/kafka-c2
+./gradlew runAdmin --args="create-topic 6"
+```
+
+c1은 기존 Kafka Port에 직접 연결하고 c2만 Toxiproxy Port를 Bootstrap Server로 사용한다. Producer와 AdminClient도 기존 직접 연결을 유지한다.
+
+```bash
+# Terminal 1
+./gradlew runConsumer --args="c1"
+
+# Terminal 2
+./gradlew runConsumer --args="c2 localhost:29092"
+
+# Terminal 3
+./gradlew runProducer --args="continuous"
+
+# 별도 Terminal
+./gradlew runAdmin --args="describe-group"
+```
+
+Network 단절 시각을 기록한 뒤 c2 전용 proxy만 비활성화한다. c1이 6개 파티션을 다시 할당받은 것을 확인할 때까지 proxy를 비활성화한 상태로 유지한다.
+
+```bash
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())' \
+  && curl -fsS \
+    -X PATCH \
+    -H 'Content-Type: application/json' \
+    -d '{"enabled":false}' \
+    http://localhost:8474/proxies/kafka-c2
+
+curl -fsS http://localhost:8474/proxies/kafka-c2
+ps -p <c2-java-pid> -o pid=,stat=,command=
+./gradlew runAdmin --args="describe-group"
+```
+
+c1의 재할당 결과를 보존한 뒤 proxy를 다시 활성화한다. c2가 재가입한 뒤 컨슈머 그룹을 다시 조회한다.
+
+```bash
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())' \
+  && curl -fsS \
+    -X PATCH \
+    -H 'Content-Type: application/json' \
+    -d '{"enabled":true}' \
+    http://localhost:8474/proxies/kafka-c2
+
+./gradlew runAdmin --args="describe-group"
+```
+
+### 실제 출력
+
+외부 터미널에 UTC 시각 `2026-10-24T11:18:58.449321+00:00`을 기록한 직후 PID 83365인 c2에 SIGKILL을 보냈다.
+
+![Session Timeout 6초 조건에서 c2에 SIGKILL을 보낸 시각](images/consumer-c2-sigkill-with-session-timeout-6s.png)
+
+c1은 장애 주입 시각으로부터 약 6.890초 뒤 기존 파티션 0, 1, 2를 반납했다. 약 9ms 뒤 파티션 0부터 5까지를 모두 다시 할당받았다.
+
+![c2 SIGKILL 이후 c1의 파티션 반납과 재할당](images/consumer-c1-rebalance-after-session-timeout-6s.png)
+
+재할당 후 AdminClient 조회에서 컨슈머 그룹은 `Stable`, 멤버 수는 1이었으며 c1이 파티션 0부터 5까지 모두 소유했다.
+
+![c2 SIGKILL 이후 하나의 멤버만 남은 컨슈머 그룹](images/consumer-group-after-session-timeout-6s.png)
+
+Session Timeout 15초 실행에서 장애 주입 전 컨슈머 그룹은 `Stable`이었고, c1은 파티션 0, 1, 2를, c2는 파티션 3, 4, 5를 소유했다.
+
+![Session Timeout 15초 실행에서 SIGKILL 전 컨슈머 그룹](images/consumer-group-before-sigkill-session-timeout-15s.png)
+
+외부 터미널에 UTC 시각 `2026-10-24T11:31:54.631760+00:00`을 기록한 직후 PID 84579인 c2에 SIGKILL을 보냈다.
+
+![Session Timeout 15초 조건에서 c2에 SIGKILL을 보낸 시각](images/consumer-c2-sigkill-with-session-timeout-15s.png)
+
+c1은 장애 주입 시각으로부터 약 14.072초 뒤 기존 파티션 0, 1, 2를 반납했다. 약 9ms 뒤 파티션 0부터 5까지를 모두 다시 할당받았다.
+
+![Session Timeout 15초 조건에서 c2 SIGKILL 이후 c1의 파티션 반납과 재할당](images/consumer-c1-rebalance-after-session-timeout-15s.png)
+
+재할당 후 AdminClient 조회에서 컨슈머 그룹은 다시 `Stable`이 되었고, 남은 c1이 파티션 6개를 모두 소유했다.
+
+![Session Timeout 15초 조건에서 c2 SIGKILL 이후 컨슈머 그룹](images/consumer-group-after-session-timeout-15s.png)
+
+Network 단절 실행에서는 `kafka-c2` proxy가 `localhost:29092`에서 요청을 받고 Kafka의 `kafka:29093`으로 전달하도록 생성했다. 생성 결과에서 proxy는 `enabled=true`였다.
+
+![c2 전용 Toxiproxy 생성](images/toxiproxy-kafka-c2-created.png)
+
+c1은 PID 86127로 시작해 `localhost:9092`에 직접 연결했고, Heartbeat 2초와 Session Timeout 6초를 적용했다. c2 합류 전에는 파티션 6개를 모두 소유했고 합류 후에는 파티션 0, 1, 2를 할당받았다.
+
+![Network 단절 전 DIRECT listener에 연결한 c1](images/consumer-c1-direct-listener-before-network-disconnection.png)
+
+c2는 PID 86155로 시작해 `localhost:29092`의 Toxiproxy를 통과했고, 같은 Heartbeat와 Session Timeout을 적용했다. c2는 파티션 3, 4, 5를 할당받았다.
+
+![Network 단절 전 PROXY listener에 연결한 c2](images/consumer-c2-proxy-listener-before-network-disconnection.png)
+
+장애 주입 전 AdminClient 조회에서 컨슈머 그룹은 `Stable`, 멤버 수는 2였으며 c1과 c2가 파티션을 3개씩 소유했다. c1은 호스트에서 직접 접속해 `/192.168.65.1`로, c2는 Toxiproxy 컨테이너를 통해 접속해 `/172.18.0.3`으로 조회되었다.
+
+![c2 Network 단절 전 컨슈머 그룹](images/consumer-group-before-c2-network-disconnection.png)
+
+UTC 시각 `2026-10-24T12:07:33.975166+00:00`을 기록한 직후 `kafka-c2` proxy를 비활성화했다. 조회 결과는 `enabled=false`였지만 PID 86155인 c2 Java 프로세스는 `S` 상태로 계속 실행 중이었다. 직후 AdminClient 조회에서는 그룹이 `PreparingRebalance`, 멤버 수가 1로 나타났으며 c1의 파티션은 아직 비어 있었다.
+
+![c2 Network 단절과 실행 중인 c2 프로세스](images/consumer-c2-network-disconnected-process-alive.png)
+
+c1은 Network 단절 시각으로부터 약 7.494초 뒤 파티션 0, 1, 2를 반납했고 약 8ms 뒤 파티션 0부터 5까지를 모두 다시 할당받았다.
+
+![c2 Network 단절 이후 c1의 파티션 반납과 재할당](images/consumer-c1-rebalance-after-c2-network-disconnection.png)
+
+UTC 시각 `2026-10-24T12:12:09.922127+00:00`을 기록한 직후 proxy를 다시 활성화했다. 이후 AdminClient 조회에서 그룹은 `Stable`, 멤버 수는 2였으며 c1은 파티션 0, 1, 2를, c2는 파티션 3, 4, 5를 다시 소유했다.
+
+![c2 Network 복구와 컨슈머 그룹 재가입](images/consumer-c2-network-recovery-and-group-rejoined.png)
+
+c1에서도 c2 재가입으로 파티션 6개를 반납한 뒤 파티션 0, 1, 2를 다시 할당받는 두 번째 리밸런싱을 확인했다.
+
+![c2 Network 복구 이후 c1의 두 번째 리밸런싱](images/consumer-c1-rebalance-after-c2-network-recovery.png)
+
+### 결과
+
+먼저 핵심 비교만 요약한다.
+
+| 확인한 질문 | 관찰 결과 | 이번 실행에서 내릴 수 있는 판단 |
+|---|---|---|
+| Session Timeout을 늘리면 감지가 늦어지는가? | SIGKILL 전체 재할당이 6초 설정에서 6.899초, 15초 설정에서 14.080초였다. | 같은 Heartbeat에서 Session Timeout이 길수록 재할당도 늦어졌다. |
+| SIGKILL과 Network 단절의 감지 시간은 다른가? | 같은 6초 설정에서 각각 6.899초와 7.501초였다. | 한 번씩 측정한 0.602초 차이만으로 장애 종류의 영향이라고 판단할 수 없다. |
+| Network가 복구되면 어떻게 되는가? | 복구 후 1.715초 안에 c1의 재할당이 끝나고 그룹이 다시 2명이 되었다. | 살아 있던 c2가 재가입하면서 두 번째 리밸런싱이 발생했다. |
+
+장애 주입과 복구 시각은 외부 터미널에서 기록하고, 리밸런싱 시작과 완료는 c1의 콜백 시각으로 관찰했다.
+
+| 기준 | 의미 |
+|---|---|
+| `T0` | c2에 SIGKILL을 보내거나 c2 전용 proxy를 비활성화한 시각 |
+| `T1` | c1의 `partitions_revoked` 콜백 시각 |
+| `T2` | c1의 `partitions_assigned` 콜백 시각 |
+| `T3` | c2 전용 proxy를 다시 활성화한 시각 |
+| `T4` | c2 재가입 후 c1의 `partitions_revoked` 콜백 시각 |
+| `T5` | c2 재가입 후 c1의 `partitions_assigned` 콜백 시각 |
+
+장애 조건별 핵심 측정값은 다음과 같다.
+
+| 장애 조건 | Heartbeat | Session Timeout | c1에서 관찰한 장애 감지 `T1-T0` | 콜백에서 관찰한 재할당 `T2-T1` | 장애 주입부터 재할당 `T2-T0` | 장애 후 c2 프로세스 |
+|---|---:|---:|---:|---:|---:|---|
+| SIGKILL | 2000ms | 6000ms | 6.889946초 | 0.009451초 | 6.899397초 | 종료 |
+| SIGKILL | 2000ms | 15000ms | 14.071643초 | 0.008774초 | 14.080417초 | 종료 |
+| Network 단절 | 2000ms | 6000ms | 7.493580초 | 0.007859초 | 7.501439초 | 실행 중 |
+
+원본 시각은 계산을 다시 검증할 수 있도록 별도로 남긴다.
+
+| 장애 조건 | Session Timeout | T0: 장애 주입 | T1: 파티션 반납 | T2: 파티션 할당 |
+|---|---:|---|---|---|
+| SIGKILL | 6000ms | 2026-10-24T11:18:58.449321Z | 2026-10-24T11:19:05.339267Z | 2026-10-24T11:19:05.348718Z |
+| SIGKILL | 15000ms | 2026-10-24T11:31:54.631760Z | 2026-10-24T11:32:08.703403Z | 2026-10-24T11:32:08.712177Z |
+| Network 단절 | 6000ms | 2026-10-24T12:07:33.975166Z | 2026-10-24T12:07:41.468746Z | 2026-10-24T12:07:41.476605Z |
+
+Network 단절과 복구 과정의 상태 변화는 다음과 같다.
+
+| 시점 | Proxy | c2 프로세스 | 그룹 상태 | 멤버 수 | c1 파티션 | c2 파티션 |
+|---|---|---|---|---:|---|---|
+| 단절 전 | `enabled=true` | 실행 중 | Stable | 2 | 0, 1, 2 | 3, 4, 5 |
+| 단절 직후 조회 | `enabled=false` | 실행 중 | PreparingRebalance | 1 | 할당 전 | - |
+| Session 만료 후 c1 콜백 | `enabled=false` | 실행 중 | 조회하지 않음 | 조회하지 않음 | 0, 1, 2, 3, 4, 5 | - |
+| Network 복구 후 | `enabled=true` | 실행 중 | Stable | 2 | 0, 1, 2 | 3, 4, 5 |
+
+Network 복구부터 c2 재가입으로 발생한 두 번째 리밸런싱까지의 측정값은 다음과 같다.
+
+| T3: Network 복구 | T4: c1 파티션 반납 | T5: c1 파티션 할당 | 재가입 관찰 `T4-T3` | 콜백에서 관찰한 재할당 `T5-T4` | 복구 후 재할당 `T5-T3` |
+|---|---|---|---:|---:|---:|
+| 2026-10-24T12:12:09.922127Z | 2026-10-24T12:12:11.627184Z | 2026-10-24T12:12:11.637034Z | 1.705057초 | 0.009850초 | 1.714907초 |
+
+### 해석 및 궁금증
+
+#### 설정값의 역할
+
+| 설정 | 설정 주체 | 의미 | 이번 실험에서 확인한 점                                                         |
+|---|---|---|-----------------------------------------------------------------------|
+| `heartbeat.interval.ms` | 컨슈머 | 브로커에 생존 신호를 보내는 주기 | 2초마다 보내더라도 한 번 누락됐다고 바로 제거되지는 않았다.                                    |
+| `session.timeout.ms` | 컨슈머 | 마지막으로 성공한 Heartbeat 이후 멤버 제거까지 허용하는 시간 | 6초에서 15초로 늘리자 장애 감지 관찰값도 약 6.890초에서 14.072초로 늘었다.                     |
+| `group.min.session.timeout.ms` | 브로커 | 컨슈머가 요청할 수 있는 Session Timeout의 최솟값 | 이 값보다 작으면 브로커가 그룹 가입을 거부한다. 현재 구현에서는 `InvalidSessionTimeoutException`이 전파되어 컨슈머 애플리케이션이 종료된다. |
+
+#### Session Timeout과 전체 복구 시간
+
+- Heartbeat를 2초로 고정하고 Session Timeout만 6초에서 15초로 늘렸을 때 SIGKILL 후 전체 재할당 시간은 약 6.899초에서 14.080초로 증가했다.
+- Experiment 4의 기본 Session Timeout 45초 조건에서는 같은 SIGKILL 후 약 44.155초가 걸렸다. 세 실행 모두 Session Timeout이 길수록 전체 재할당도 길어지는 방향을 보였다.
+- 세 장애 실행에서 파티션 반납부터 재할당까지의 콜백 구간은 약 8~9ms였다. 전체 시간의 대부분은 파티션 할당 자체보다 Session 만료를 기다리는 구간에서 발생했다.
+
+#### SIGKILL과 Network 단절
+
+- 같은 Heartbeat 2초와 Session Timeout 6초에서 전체 재할당 시간은 SIGKILL 약 6.899초, Network 단절 약 7.501초였다.
+- 차이는 약 0.602초였지만 각 조건을 한 번씩만 실행했으므로 장애 종류가 감지 시간을 다르게 만들었다고 일반화할 수 없다.
+- 브로커에는 두 조건 모두 c2의 Heartbeat가 도착하지 않았다. Heartbeat 부재만으로 c2 프로세스 종료와 Network 단절의 원인을 구분할 수는 없었다.
+- Network 단절에서는 c2 프로세스가 계속 실행되었다. Proxy를 복구하자 같은 c2가 다시 가입해 두 번째 리밸런싱이 발생했다. SIGKILL에서는 c2 프로세스를 다시 시작하지 않아 재가입이 발생하지 않았다.
+
+#### Network 단절 구성에서 확인한 개념
+
+| 구성 | 의미 | 이번 구성에서의 값 |
+|---|---|---|
+| `KAFKA_LISTENERS` | Kafka가 실제 연결을 받는 주소와 포트 | `DIRECT://:9092`, `PROXY://:29093`, `CONTROLLER://:9093` |
+| `KAFKA_ADVERTISED_LISTENERS` | Bootstrap 이후 클라이언트에 알려주는 재접속 주소 | c1은 `localhost:9092`, c2는 `localhost:29092` |
+| `KAFKA_LISTENER_SECURITY_PROTOCOL_MAP` | listener 이름을 실제 보안 프로토콜에 연결 | `DIRECT`와 `PROXY` 모두 `PLAINTEXT` |
+| Toxiproxy | TCP 연결을 중계하고 장애를 주입 | `localhost:29092`에서 받아 `kafka:29093`으로 전달 |
+
+- 변경 전 `PLAINTEXT://:9092`의 앞부분은 listener 이름이었다. `PLAINTEXT:PLAINTEXT` 매핑에서는 왼쪽이 listener 이름, 오른쪽이 암호화와 인증을 사용하지 않는 보안 프로토콜이었다.
+- 현재는 경로를 구분하기 위해 listener 이름을 `DIRECT`와 `PROXY`로 바꿨을 뿐, 두 경로 모두 `PLAINTEXT`를 사용하므로 보안 방식은 바뀌지 않았다.
+- Kafka 클라이언트는 `bootstrap.servers`에만 계속 연결하지 않고 브로커가 광고한 주소로 다시 연결한다. 따라서 c2가 Toxiproxy를 우회하지 않도록 `PROXY`의 광고 주소도 `localhost:29092`로 설정했다.
+- `CONTROLLER://:9093`은 KRaft Controller 통신용이고 이번 컨슈머 Network 단절 대상이 아니다. `depends_on`도 컨테이너 시작 순서만 보장하며 Kafka의 준비 완료까지 보장하지 않는다.
+
+#### 측정 한계와 남은 질문
+
+| 항목 | 한계 또는 다음 확인 사항 |
+|---|---|
+| 장애 감지 시각 | `T1`은 브로커 내부의 Session 만료 시각이 아니라 c1이 파티션 반납 콜백을 실행한 시각이다. |
+| Session Timeout과 측정값 차이 | `T0`가 마지막 Heartbeat 성공 시각과 일치하지 않아 측정값이 설정값과 정확히 같지 않다. |
+| 장애 종류 비교 | 각 조건을 한 번만 실행했으므로 반복 실행 결과의 분포와 편차는 확인하지 않았다. |
+| Network 단절 후 Group 상태 | c1의 6개 파티션 할당은 콜백으로 확인했지만 그 시점의 최종 `Stable` 상태를 AdminClient로 조회하지 않았다. |
+| 짧은 Session Timeout의 위험 | 정상 컨슈머가 일시적인 Network 지연, 브로커 지연 또는 긴 JVM pause 때문에 제거되는 조건은 아직 재현하지 않았다. |
+| 장애 원인 구분 | 브로커가 관찰하는 Heartbeat 부재만으로 프로세스 종료, Network 단절과 일시적인 지연을 구분할 수 있는지 추가 로그와 메트릭으로 확인할 필요가 있다. |
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임
@@ -590,5 +934,14 @@ c1의 레코드 로그에서 관찰한 출력 간격은 리밸런싱 시간과 �
 - 원인: Experiment 4의 첫 번째 실행에서 `ps -ef | grep c2`에 표시된 Gradle Wrapper PID를 종료했다. 실제 c2는 Gradle이 실행한 별도의 `OrderEventConsumerKt c2` JVM이었다.
 - 해결: 컨슈머가 시작할 때 자신의 PID를 출력하도록 하고 그 PID에 SIGTERM을 보낸다. SIGTERM 수신 시 `poll()`을 중단하고 컨슈머 실행 스레드에서 `consumer.close()`를 호출하는 종료 처리도 먼저 구현한다.
 - 재발 방지: 종료 전에 PID의 명령이 `lab.kafka.OrderEventConsumerKt c2`인지 확인하며, Gradle Wrapper나 Gradle Daemon PID를 사용하지 않는다.
+
+### Experiment 5 Network 단절 구성 점검
+
+- c2의 시작 로그에서 `bootstrapServers=localhost:29092`인지 확인한다. `localhost:9092`라면 c2도 Kafka에 직접 연결하므로 Toxiproxy를 비활성화해도 영향을 받지 않는다.
+- Kafka 클라이언트는 Bootstrap Server에서 브로커 메타데이터를 받은 뒤 광고된 주소로 다시 연결한다. `PROXY`의 `advertised.listeners`가 `localhost:9092`를 가리키면 c2가 첫 연결 이후 Toxiproxy를 우회하므로 `PROXY://localhost:29092`로 유지한다.
+- Toxiproxy 컨테이너 안에서 `localhost`는 Kafka가 아니라 Toxiproxy 자신이다. Proxy의 `upstream`은 Compose service 이름을 사용해 `kafka:29093`으로 설정한다.
+- Toxiproxy를 비활성화했을 때 c1까지 끊긴다면 c1이 `localhost:29092`를 사용하고 있거나 Kafka 컨테이너 또는 공통 Docker Network를 중단한 것이다. c1, Producer와 AdminClient는 `localhost:9092`의 `DIRECT` 경로를 유지한다.
+- `depends_on`은 컨테이너 시작 순서만 보장한다. Kafka 준비 전에 Topic 생성이 실패하면 `docker compose ps`와 `docker compose logs kafka`로 브로커 상태를 확인한 뒤 명령을 다시 실행한다.
+- Toxiproxy API는 인증 없이 Proxy 상태를 변경할 수 있으므로 `8474`와 c2 접속용 `29092`는 `127.0.0.1`에만 bind한다.
 
 ## Key Takeaways

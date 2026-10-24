@@ -1,6 +1,7 @@
 package lab.kafka
 
 import lab.kafka.config.KafkaConfigLoader
+import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.common.errors.WakeupException
 import java.time.Duration
@@ -9,17 +10,24 @@ import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
 
 fun main(args: Array<String>) {
-    val consumerId = args.singleOrNull() ?: error("Consumer ID is required.")
+    require(args.size in 1..2) {
+        "Usage: <consumer-id> [bootstrap-servers]"
+    }
 
     val config = KafkaConfigLoader.load().kafka
 
+    val consumerId = args[0]
+    val bootstrapServers = args.getOrNull(1) ?: config.bootstrapServers
+
     val props = Properties().apply {
         put("client.id", consumerId)
-        put("bootstrap.servers", config.bootstrapServers)
+        put("bootstrap.servers", bootstrapServers)
         put("group.id", config.consumer.groupId)
         put("key.deserializer", config.consumer.keyDeserializer)
         put("value.deserializer", config.consumer.valueDeserializer)
         put("auto.offset.reset", config.consumer.autoOffsetReset)
+        put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, config.consumer.heartbeatIntervalMs)
+        put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, config.consumer.sessionTimeoutMs)
     }
 
     val consumer = KafkaConsumer<String, String>(props)
@@ -37,7 +45,13 @@ fun main(args: Array<String>) {
     }, "consumer-shutdown-$consumerId")
 
     Runtime.getRuntime().addShutdownHook(shutdownHook)
-    logLifecycle(consumerId, "consumer_started", "pid=$pid")
+    logLifecycle(
+        consumerId,
+        "consumer_started",
+        "pid=$pid bootstrapServers=$bootstrapServers " +
+            "heartbeatIntervalMs=${config.consumer.heartbeatIntervalMs} " +
+            "sessionTimeoutMs=${config.consumer.sessionTimeoutMs}"
+    )
 
     try {
         consumer.subscribe(
