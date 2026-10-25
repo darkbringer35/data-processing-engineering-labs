@@ -1121,6 +1121,318 @@ Experiment 5의 프로세스 강제 종료나 Network 단절처럼 `LeaveGroup` 
 | Commit 결과 | 현재 로그에는 Offset Commit 성공과 실패가 기록되지 않아 중복 처리의 정확한 Commit 경계를 확인하지 못했다. |
 | 반복성 | 한 번의 실행 결과이므로 처리 지연과 리밸런싱 횟수의 분포는 확인하지 않았다. |
 
+## Experiment 7. Compare Partition Assignors
+
+### 목적
+
+- Range, RoundRobin, Sticky와 CooperativeSticky Assignor의 파티션 분배를 비교한다.
+- 컨슈머가 1명에서 2명, 3명으로 늘고 c2가 이탈할 때 파티션 소유자가 얼마나 바뀌는지 확인한다.
+- Eager Rebalance와 Cooperative Rebalance에서 기존 컨슈머가 반납하는 파티션 범위를 비교한다.
+
+### 명령어
+
+컨슈머 실행 인자는 다음 순서로 받도록 확장했다. Assignor를 지정하지 않으면 기존 설정을 사용하고, 지정할 때는 `range`, `roundrobin`, `sticky`, `cooperative-sticky` 중 하나를 사용한다.
+
+```text
+<consumer-id> [bootstrap-servers] [processing-delay-ms] [group-id] [assignor]
+```
+
+코드가 컴파일되는지 확인하고, 6개 파티션의 토픽과 지속 프로듀서를 준비했다. 네 Assignor의 실행이 끝날 때까지 같은 토픽과 프로듀서를 유지하되, 이전 실행의 그룹 상태가 섞이지 않도록 Assignor마다 다른 `group.id`를 사용했다.
+
+```bash
+./gradlew compileKotlin
+docker compose config --quiet
+
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+./gradlew --quiet runProducer --args="continuous"
+```
+
+각 Assignor에서 같은 순서를 반복했다.
+
+1. c1을 실행한다.
+2. c2를 실행한 뒤 멤버가 2명인 할당을 저장한다.
+3. c3를 실행한 뒤 멤버가 3명인 할당을 저장한다.
+4. c2를 정상 종료하고 c1과 c3의 재할당 결과를 저장한다.
+5. 세 컨슈머 로그에서 `partitions_revoked`, `partitions_assigned` 콜백만 모은다.
+
+Range의 실행 명령은 다음과 같다. Range에서는 c2에 `SIGTERM`을 보냈고, 나머지 세 Assignor에서는 c2 터미널에서 `Ctrl+C`로 종료했다. 두 방식 모두 Shutdown Hook을 거쳐 `consumer.close()`를 호출하는 정상 종료 경로다.
+
+```bash
+# Terminal 1
+./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 0 lab03-ex7-range range" \
+  | tee /tmp/lab03-ex7-range-c1.log
+
+# Terminal 2
+./gradlew --quiet runConsumer \
+  --args="c2 localhost:9092 0 lab03-ex7-range range" \
+  | tee /tmp/lab03-ex7-range-c2.log
+
+# 멤버 2명
+./gradlew --quiet runAdmin \
+  --args="describe-group lab03-ex7-range" \
+  | tee /tmp/lab03-ex7-range-2-members.log
+
+# Terminal 3
+./gradlew --quiet runConsumer \
+  --args="c3 localhost:9092 0 lab03-ex7-range range" \
+  | tee /tmp/lab03-ex7-range-c3.log
+
+# 멤버 3명
+./gradlew --quiet runAdmin \
+  --args="describe-group lab03-ex7-range" \
+  | tee /tmp/lab03-ex7-range-3-members.log
+
+# c2의 consumer_started 로그에서 확인한 PID에 SIGTERM을 전송한다.
+kill -TERM <c2-pid>
+
+# c2 종료 후
+./gradlew --quiet runAdmin \
+  --args="describe-group lab03-ex7-range" \
+  | tee /tmp/lab03-ex7-range-after-c2-exit.log
+
+grep -E 'event=partitions_(revoked|assigned)' \
+  /tmp/lab03-ex7-range-c1.log \
+  /tmp/lab03-ex7-range-c2.log \
+  /tmp/lab03-ex7-range-c3.log \
+  | tee /tmp/lab03-ex7-range-rebalance-events.log
+```
+
+나머지 Assignor도 위 명령의 Assignor 이름, Group ID와 로그 접두사만 다음과 같이 바꿔 실행했다.
+
+| Assignor 인자 | Group ID | 로그 접두사 |
+|---|---|---|
+| `roundrobin` | `lab03-ex7-roundrobin` | `/tmp/lab03-ex7-roundrobin` |
+| `sticky` | `lab03-ex7-sticky` | `/tmp/lab03-ex7-sticky` |
+| `cooperative-sticky` | `lab03-ex7-cooperative-sticky` | `/tmp/lab03-ex7-cooperative-sticky` |
+
+`grep` 결과는 컨슈머별 파일 순서로 출력되므로 한 화면에서 위아래 순서만 보고 이벤트 발생 순서를 판단하지 않았다. 서로 다른 컨슈머의 이벤트는 각 줄의 `timestamp`를 함께 비교했다.
+
+### 실제 출력
+
+#### 1. Range
+
+c1만 있을 때는 6개 파티션을 모두 소유했다. c2 합류 후에는 연속된 파티션을 3개씩, c3 합류 후에는 2개씩 소유했다. c2가 이탈하자 c1은 0, 1, 2를, c3는 3, 4, 5를 소유했다.
+
+![Range에서 c1이 6개 파티션을 소유한 상태](images/ex7-range-group-one-member.png)
+
+![Range에서 컨슈머 2명의 파티션 할당](images/ex7-range-group-two-members.png)
+
+![Range에서 컨슈머 3명의 파티션 할당](images/ex7-range-group-three-members.png)
+
+![Range에서 c2 종료 후 파티션 할당](images/ex7-range-group-after-c2-exit.png)
+
+![Range의 c2 SIGTERM](images/ex7-range-c2-sigterm.png)
+
+![Range의 파티션 반납 및 할당 콜백](images/ex7-range-rebalance-events.png)
+
+#### 2. RoundRobin
+
+컨슈머가 2명일 때 c1은 짝수 파티션, c2는 홀수 파티션을 소유했다. 3명이 되거나 c2가 이탈한 뒤에도 파티션 번호를 컨슈머 순서대로 번갈아 배분했다.
+
+![RoundRobin에서 컨슈머 2명의 파티션 할당](images/ex7-roundrobin-group-two-members.png)
+
+![RoundRobin에서 컨슈머 3명의 파티션 할당](images/ex7-roundrobin-group-three-members.png)
+
+![RoundRobin에서 c2 종료 후 파티션 할당](images/ex7-roundrobin-group-after-c2-exit.png)
+
+![RoundRobin의 파티션 반납 및 할당 콜백](images/ex7-roundrobin-rebalance-events.png)
+
+#### 3. Sticky
+
+각 단계의 파티션 수는 균등하게 유지하면서, 직전 할당을 가능한 한 보존했다. c2가 이탈한 뒤에도 c1의 0, 1과 c3의 2, 5는 그대로 유지됐다.
+
+![Sticky에서 컨슈머 2명의 파티션 할당](images/ex7-sticky-group-two-members.png)
+
+![Sticky에서 컨슈머 3명의 파티션 할당](images/ex7-sticky-group-three-members.png)
+
+![Sticky에서 c2 종료 후 파티션 할당](images/ex7-sticky-group-after-c2-exit.png)
+
+![Sticky의 파티션 반납 및 할당 콜백](images/ex7-sticky-rebalance-events.png)
+
+#### 4. CooperativeSticky
+
+Stable 상태의 최종 할당은 Sticky와 같았다. 차이는 할당 결과가 아니라 콜백 과정에서 나타났다. c2가 합류할 때 c1은 넘겨줄 3, 4, 5만 반납했고, c3가 합류할 때도 c1은 2, c2는 5만 반납했다.
+
+![CooperativeSticky에서 컨슈머 2명의 파티션 할당](images/ex7-cooperative-sticky-group-two-members.png)
+
+![CooperativeSticky에서 컨슈머 3명의 파티션 할당](images/ex7-cooperative-sticky-group-three-members.png)
+
+![CooperativeSticky에서 c2 종료 후 파티션 할당](images/ex7-cooperative-sticky-group-after-c2-exit.png)
+
+![CooperativeSticky의 파티션 반납 및 할당 콜백](images/ex7-cooperative-sticky-rebalance-events.png)
+
+### 결과
+
+#### 파티션 할당 변화
+
+표의 숫자는 파티션 번호다.
+
+| Assignor | 컨슈머 1명 | 컨슈머 2명 | 컨슈머 3명 | c2 종료 후 |
+|---|---|---|---|---|
+| Range | c1: 0–5 | c1: 0,1,2<br>c2: 3,4,5 | c1: 0,1<br>c2: 2,3<br>c3: 4,5 | c1: 0,1,2<br>c3: 3,4,5 |
+| RoundRobin | c1: 0–5 | c1: 0,2,4<br>c2: 1,3,5 | c1: 0,3<br>c2: 1,4<br>c3: 2,5 | c1: 0,2,4<br>c3: 1,3,5 |
+| Sticky | c1: 0–5 | c1: 0,1,2<br>c2: 3,4,5 | c1: 0,1<br>c2: 3,4<br>c3: 2,5 | c1: 0,1,3<br>c3: 2,4,5 |
+| CooperativeSticky | c1: 0–5 | c1: 0,1,2<br>c2: 3,4,5 | c1: 0,1<br>c2: 3,4<br>c3: 2,5 | c1: 0,1,3<br>c3: 2,4,5 |
+
+#### 파티션 이동량과 반납 범위
+
+`이동 수`는 앞 단계와 다음 Stable 상태에서 소유자가 달라진 파티션의 수다. `기존 컨슈머의 반납 수`는 리밸런싱에 계속 참여하는 컨슈머의 `partitions_revoked`에 나타난 파티션 수의 합이다. c2 종료 단계에서는 종료 중인 c2가 반납한 2개를 제외해, 계속 실행 중인 c1과 c3가 작업을 멈춰야 하는 범위만 비교했다.
+
+| Assignor | 이동 수<br>1→2 / 2→3 / c2 종료 | 기존 컨슈머의 반납 수<br>1→2 / 2→3 / c2 종료 | 관찰한 특징 |
+|---|---:|---:|---|
+| Range | 3 / 3 / 2 | 6 / 6 / 4 | 연속 구간을 다시 만들면서 2→3에서 최소량보다 1개 더 이동했다. |
+| RoundRobin | 3 / 4 / 4 | 6 / 6 / 4 | 매 단계 균등했지만 번호를 번갈아 배치하면서 이동이 가장 많았다. |
+| Sticky | 3 / 2 / 2 | 6 / 6 / 4 | 이동량은 최소였지만 Eager 방식이므로 기존 할당을 모두 반납했다. |
+| CooperativeSticky | 3 / 2 / 2 | 3 / 2 / 0 | Sticky와 같은 최종 할당을 만들면서 실제로 넘길 파티션만 반납했다. |
+
+정상 종료한 c2 자체에서는 네 Assignor 모두 자신이 소유하던 2개 파티션의 반납 콜백이 실행됐다. 이 값까지 포함하면 c2 종료 단계의 전체 반납 수는 Range, RoundRobin, Sticky가 각각 6개이고 CooperativeSticky는 2개다.
+
+`반납 수`와 `이동 수`는 서로 다른 비용을 나타낸다.
+
+| 관찰값 | 나타내는 비용 | 값이 클 때 발생할 수 있는 일 |
+|---|---|---|
+| 반납 수 | 리밸런싱 중 처리를 멈추는 범위 | 일시적인 처리량 감소와 Consumer Lag 증가 |
+| 이동 수 | 리밸런싱 후 소유자가 실제로 바뀌는 범위 | 파티션별 상태 저장·전달, 캐시 재구축, Offset과 외부 리소스 초기화 증가 |
+
+예를 들어 Sticky의 2→3 단계에서는 기존 컨슈머가 6개를 모두 반납했지만 실제로 새 컨슈머에게 이동한 파티션은 2와 5뿐이었다. 즉 Eager Rebalance로 인한 전체 중단 범위는 줄이지 못했지만, 새 소유자에게 작업 상태를 인계하고 초기화해야 하는 범위는 최소화했다.
+
+#### 레코드 출력 중단 관찰
+
+이번 실행에서는 모든 레코드를 한 로그로 시간순 병합해 리밸런싱 전후의 출력 간격을 측정하는 명령을 별도로 수행하지 않았다. 따라서 Assignor별 정확한 처리 중단 시간을 숫자로 결론 내리지는 않았다.
+
+다만 CooperativeSticky의 합류 과정에서는 콜백이 두 단계로 약 2초간 이어지는 동안에도, 반납하지 않은 파티션의 레코드가 계속 출력됐다. 반면 Range, RoundRobin과 Sticky는 합류 시 기존 컨슈머의 파티션을 모두 반납했다. 이 로그로 확인한 차이는 `리밸런싱에 걸린 총시간`보다 `리밸런싱 중 계속 처리할 수 있는 파티션의 범위`다.
+
+### 해석 및 궁금증
+
+#### Range와 RoundRobin은 모두 균등하지만 할당 모양이 다르다
+
+토픽이 하나이고 파티션 6개가 컨슈머 수로 나누어떨어져서 두 Assignor 모두 파티션 개수는 `3:3`, `2:2:2`, `3:3`으로 균등했다. 그러나 Range는 토픽 안에서 연속 구간을 주고, RoundRobin은 파티션을 컨슈머 순서대로 번갈아 줬다.
+
+따라서 최종 파티션 개수만 보면 차이가 작아 보이지만, 기존 소유자까지 비교하면 차이가 드러난다. 2명에서 3명으로 늘 때 Range는 3개, RoundRobin은 4개가 이동했다. 이 실험은 토픽 하나에서의 결과이며, 여러 토픽과 서로 다른 파티션 수를 사용하면 균등성도 달라질 수 있다.
+
+#### 균등 분배와 최소 이동은 별개의 목표다
+
+네 Assignor 모두 각 단계에서 파티션 수를 균등하게 만들었다. 하지만 같은 균등 상태를 만드는 데 필요한 이동량은 달랐다.
+
+- 1명에서 2명으로 늘 때 새 컨슈머가 3개를 받아야 하므로 최소 이동량은 3개다.
+- 2명에서 3명으로 늘 때 새 컨슈머가 2개를 받아야 하므로 최소 이동량은 2개다.
+- 3명 중 1명이 빠질 때 그 컨슈머의 2개를 다른 컨슈머가 받아야 하므로 최소 이동량은 2개다.
+
+Sticky와 CooperativeSticky는 `3 / 2 / 2`로 세 단계 모두 최소 이동량을 달성했다. Range와 RoundRobin은 균등한 결과를 만들었지만 일부 단계에서 이미 할당된 파티션까지 추가로 이동했다.
+
+#### Sticky와 CooperativeSticky의 차이는 최종 할당보다 전환 과정이다
+
+이번 실행에서 두 Assignor의 Stable 상태 할당과 이동량은 같았다. 그러나 Sticky는 Eager Rebalance를 사용하므로 기존 컨슈머가 현재 파티션을 모두 반납한 뒤 새 할당을 받았다. `sticky`는 직전 소유 관계를 가능한 한 유지하는 할당 계산 방식이지, 파티션을 부분적으로 반납하는 프로토콜을 뜻하지 않는다.
+
+Sticky에서 최소 이동이 의미하는 것은 `전체 처리 중단 최소화`가 아니라 `리밸런싱 후 실제 소유권 변경 최소화`다.
+
+```text
+리밸런싱 전
+c1: [0, 1, 2]
+c2: [3, 4, 5]
+
+Sticky 리밸런싱 후
+c1: [0, 1]
+c2: [3, 4]
+c3: [2, 5]
+```
+
+c1과 c2는 Eager Rebalance 때문에 6개를 모두 반납하지만, 0, 1, 3, 4는 이전 소유자에게 다시 돌아간다. 실제 소유권이 바뀌는 것은 2와 5뿐이다.
+
+이 차이는 파티션별 로컬 캐시, 집계 상태, 파일, 외부 시스템 연결처럼 소유자에 종속된 상태가 있을 때 중요하다. 같은 컨슈머가 다시 받은 파티션의 상태를 재사용하도록 구현하면 4개 파티션은 상태를 다른 프로세스로 전달하거나 처음부터 준비할 필요가 없다. 반대로 `onPartitionsRevoked()`에서 모든 상태를 즉시 제거하고 `onPartitionsAssigned()`에서 모두 다시 만든다면 Sticky의 최소 이동 장점을 충분히 활용하지 못한다. 이전 할당을 기억한 뒤 새 할당과 비교해 실제로 잃은 파티션만 정리하는 방식이 필요하다.
+
+현재 실험처럼 레코드를 출력하기만 하고 파티션별 상태를 유지하지 않는 컨슈머에서는 Eager Sticky의 실무 효과가 작게 보일 수 있다. 상태 저장 처리에서는 이동 수가 많을수록 상태 복원 시간, 원격 저장소 접근량과 캐시가 비어 있는 시간이 늘 수 있다.
+
+CooperativeSticky는 넘겨야 할 파티션만 먼저 반납하고 나머지는 계속 소유했다. c3 합류 시 다음과 같이 c1과 c2가 한 개씩만 넘긴 것이 대표적이다.
+
+```text
+c1: revoked [2], retained [0, 1]
+c2: revoked [5], retained [3, 4]
+c3: assigned [2, 5]
+```
+
+따라서 CooperativeSticky는 서로 다른 두 비용을 함께 줄인다.
+
+- Sticky 할당 계산으로 실제 소유자가 바뀌는 파티션 수를 줄인다.
+- Cooperative Rebalance로 소유자가 바뀌지 않는 파티션을 반납하지 않고 계속 처리한다.
+
+#### 파티션 이동은 중복이나 유실을 뜻하지 않는다
+
+파티션 이동은 Offset과 처리 상태를 인계해야 하는 경계를 만든다. 하지만 파티션이 하나라도 이동했다고 해서 반드시 중복이나 유실이 발생하는 것은 아니다. 정상적인 리밸런싱에서는 이전 소유자가 파티션을 반납한 다음 새 소유자가 할당받는다.
+
+처리 완료와 Offset Commit의 순서에 따라 결과가 달라진다. 아래의 Offset 101은 다음에 처리할 레코드를 뜻한다.
+
+| 리밸런싱 직전 상태 | 새 소유자의 시작 위치 | 결과 |
+|---|---|---|
+| 레코드 100 처리 완료 → Offset 101 Commit 성공 | 101 | 중복과 유실 없음 |
+| 레코드 100 처리 완료 → 외부 반영 완료 → Commit 전 이동 | 마지막 Commit 위치인 100 | 레코드 100 중복 처리 가능 |
+| Offset 101 Commit → 레코드 100 외부 반영 실패 → 이동 | 101 | 애플리케이션 관점의 유실 가능 |
+
+따라서 최소 이동은 중복·유실을 보장하는 기능이 아니라, 이런 인계 경계에 놓이는 파티션 수와 상태 이전 비용을 줄이는 기능이다. 중복과 유실은 Offset Commit과 실제 처리 결과를 어떤 순서와 원자성으로 관리하는지에 달려 있다.
+
+`onPartitionsRevoked()`는 정상적인 소유권 이전 전에 처리 완료 Offset과 파티션 상태를 저장할 기회를 제공한다. 하지만 프로세스 강제 종료나 Session Timeout처럼 이전 소유자가 콜백을 실행하지 못하는 경우도 있으므로, 실무에서는 다음 대책을 함께 고려해야 한다.
+
+- 처리 완료 후 Offset을 Commit해 기본적으로 At-least-once를 유지한다.
+- 중복 실행되어도 결과가 달라지지 않도록 멱등성을 확보한다.
+- Kafka 입출력을 함께 묶을 수 있다면 Transaction과 `read_committed`를 검토한다.
+- DB 같은 외부 시스템과 함께 처리하면 고유 이벤트 ID, Unique Constraint 또는 처리 이력으로 중복을 방어한다.
+
+이번 코드의 `RebalanceLoggingListener`는 콜백을 출력할 뿐 Offset을 직접 Commit하거나 파티션 상태를 저장하지 않는다. 컨슈머도 `enable.auto.commit`을 명시하지 않아 Kafka Client 기본값인 Auto Commit을 사용한다. 따라서 이번 캡처로 확인한 것은 반납 및 할당 범위이며, 중복·유실이나 처리 결과의 원자성은 검증하지 않았다.
+
+#### CooperativeSticky의 빈 Assigned 콜백
+
+CooperativeSticky 로그에는 `partitions_assigned partitions=`처럼 빈 할당 콜백이 나타났다. 첫 단계에서 기존 컨슈머는 넘길 파티션만 반납하고, 유지하는 파티션은 이미 소유 중이므로 새로 할당할 목록이 없을 수 있다. 이후 소유권 이전이 끝난 다음 단계에서 새 컨슈머가 해당 파티션을 받는다. 빈 목록은 컨슈머가 모든 파티션을 잃었다는 뜻이 아니다.
+
+#### Cooperative Rebalance도 중단을 완전히 제거하지는 않는다
+
+Cooperative Rebalance는 모든 기존 컨슈머가 모든 파티션을 한꺼번에 반납하는 상황을 줄인다. 하지만 실제로 소유자가 바뀌는 파티션은 이전 컨슈머가 반납한 뒤 새 컨슈머가 할당받아야 하므로 그 파티션에는 전환 구간이 있다. Group Coordinator 통신, 콜백과 추가 리밸런싱 단계도 사라지지 않는다.
+
+이번 로그에서 확인한 것은 `전체 파티션의 동시 중단을 피하고 유지한 파티션의 처리를 계속했다`는 점이다. 파티션별 정확한 중단 시간을 비교하려면 다음 실행에서 파티션별 마지막 처리 시각과 새 소유자의 최초 처리 시각을 별도로 계산해야 한다.
+
+#### 같은 그룹에서 서로 다른 Assignor를 설정하면 어떻게 되는가
+
+Assignor는 컨슈머마다 따로 실행되어 각자의 파티션을 결정하는 설정이 아니다. 같은 `group.id`의 멤버는 자신이 지원하는 Assignor 목록을 알리고, 그룹 전체가 공통으로 지원하는 Assignor 하나를 선택한다. 선택된 Assignor가 모든 멤버의 구독 정보를 사용해 그룹 전체의 파티션 할당을 계산한다.
+
+현재 코드는 실행 인자로 받은 Assignor 하나만 `partition.assignment.strategy`에 등록한다. 따라서 같은 그룹에서 c1은 `range`, c2는 `sticky`로 실행하면 공통 Assignor가 없다.
+
+```text
+c1 지원 목록: [range]
+c2 지원 목록: [sticky]
+교집합:       []
+결과:         InconsistentGroupProtocolException
+```
+
+이 경우 Range가 일부 파티션을 할당하고 Sticky가 나머지를 할당하는 식으로 두 전략이 섞이지 않는다. 새 멤버는 기존 그룹과 호환되는 프로토콜로 가입할 수 없고, 하나의 정상적인 그룹 할당을 만들 수 없다.
+
+여러 Assignor를 선호도 순서대로 등록하면 공통 항목을 선택할 수 있다.
+
+```text
+c1: [cooperative-sticky, range]
+c2: [range]
+공통 Assignor: range
+
+c1: [cooperative-sticky, range]
+c2: [cooperative-sticky, range]
+공통 우선 Assignor: cooperative-sticky
+```
+
+이 방식은 운영 중 Assignor를 바꿀 때 기존 버전과 새 버전이 공통 전략을 유지하도록 하는 Rolling Migration에 사용된다. 모든 멤버가 새 전략을 지원하도록 배포한 뒤 이전 전략을 목록에서 제거해 전환할 수 있다. 멤버별 목록이나 우선순위가 의도치 않게 다르면 예상과 다른 전략이 선택되거나 그룹 가입이 실패할 수 있으므로, 같은 Consumer Group의 설정은 배포 단위에서 일관되게 관리해야 한다.
+
+이번 실험에서 Assignor마다 서로 다른 `group.id`를 사용한 이유도 전략을 혼합하기 위한 것이 아니라, 각 그룹이 하나의 Assignor만 사용하도록 분리해 결과와 Offset을 독립적으로 비교하기 위해서다.
+
+#### 실무에서 구분할 선택 기준
+
+| Assignor | 전체 파티션 동시 반납 | 실제 소유권 이동 | 실무적 의미 |
+|---|---|---|---|
+| Range | 발생 | 배치에 따라 증가 | 토픽별 연속 구간이라는 단순한 할당이 필요할 때 이해하기 쉽지만, 균형과 이동량은 구독 구조에 영향을 받는다. |
+| RoundRobin | 발생 | 배치에 따라 증가 | 전체 파티션 수를 균등하게 나누기 쉽지만, 멤버 변화 때 기존 소유권을 많이 바꿀 수 있다. |
+| Sticky | 발생 | 최소화 | 전체 중단은 허용되지만 파티션별 상태 이전과 재초기화 비용을 줄이고 싶을 때 의미가 있다. |
+| CooperativeSticky | 이동 대상만 반납 | 최소화 | 이동하지 않는 파티션의 처리를 유지하면서 상태 이전 비용도 줄인다. |
+
+결론적으로 Assignor를 비교할 때는 최종 파티션 개수만 확인해서는 부족하다. `얼마나 균등한가`, `몇 개의 소유자가 바뀌는가`, `리밸런싱 중 몇 개를 멈추는가`, `인계 시 Offset과 상태를 어떻게 안전하게 저장하는가`를 별도로 확인해야 한다.
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임

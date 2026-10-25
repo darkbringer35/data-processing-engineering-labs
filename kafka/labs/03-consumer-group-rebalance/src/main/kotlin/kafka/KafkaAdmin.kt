@@ -30,8 +30,8 @@ fun main(args: Array<String>) {
                 describeTopic(admin, config.topic.name)
             }
             DESCRIBE_GROUP -> {
-                requireNoOptions(command, options)
-                describeConsumerGroup(admin, config.consumer.groupId)
+                val groupId = parseGroupId(options, config.consumer.groupId)
+                describeConsumerGroup(admin, groupId)
             }
             else -> error("Unknown admin command: $command\n${usage()}")
         }
@@ -111,4 +111,21 @@ private fun printUsage() {
     println(usage())
 }
 
-private fun usage() = "Usage: runAdmin --args=<$CREATE_TOPIC [partitions]|$DESCRIBE_TOPIC|$DESCRIBE_GROUP>"
+private fun usage() = "Usage: runAdmin --args=<$CREATE_TOPIC [partitions]|$DESCRIBE_TOPIC|$DESCRIBE_GROUP [group-id]>"
+
+private fun parseGroupId(
+    options: List<String>,
+    defaultGroupId: String
+): String {
+    require(options.size <= 1) {
+        "'$DESCRIBE_GROUP' accepts at most one group ID.\n${usage()}"
+    }
+
+    val groupId = options.singleOrNull() ?: defaultGroupId
+
+    require(groupId.isNotBlank()) {
+        "Group ID must not be blank."
+    }
+
+    return groupId
+}
