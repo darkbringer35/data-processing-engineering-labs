@@ -908,6 +908,219 @@ Network 복구부터 c2 재가입으로 발생한 두 번째 리밸런싱까지�
 | 짧은 Session Timeout의 위험 | 정상 컨슈머가 일시적인 Network 지연, 브로커 지연 또는 긴 JVM pause 때문에 제거되는 조건은 아직 재현하지 않았다. |
 | 장애 원인 구분 | 브로커가 관찰하는 Heartbeat 부재만으로 프로세스 종료, Network 단절과 일시적인 지연을 구분할 수 있는지 추가 로그와 메트릭으로 확인할 필요가 있다. |
 
+## Experiment 6. Slow Consumer and `max.poll.interval.ms`
+
+### 목적
+
+- 레코드 처리가 느려 다음 `poll()` 호출이 지연될 때 컨슈머 그룹과 파티션 할당이 어떻게 변하는지 확인한다.
+- `heartbeat.interval.ms`, `session.timeout.ms`와 `max.poll.interval.ms`가 확인하는 상태를 구분한다.
+- 프로세스와 Heartbeat Thread가 실행 중이어도 컨슈머 그룹이 불안정해질 수 있는지 확인한다.
+
+### 명령어
+
+한 번의 `poll()`이 반환하는 레코드 수 때문에 처리 시간이 달라지지 않도록 `max.poll.records`를 1로 제한했다. 실험 시간을 줄이기 위해 `max.poll.interval.ms`는 5초로 설정하고, Heartbeat와 Session Timeout은 Experiment 5에서 사용한 2초와 6초를 유지했다.
+
+```yaml
+kafka:
+  consumer:
+    heartbeat-interval-ms: 2000
+    session-timeout-ms: 6000
+    max-poll-records: 1
+    max-poll-interval-ms: 5000
+```
+
+컨슈머는 세 번째 실행 인자로 레코드 한 건의 처리 지연을 밀리초 단위로 받는다. 같은 그룹에서 다음 두 조건을 동시에 실행했다.
+
+| 컨슈머 | 한 건의 처리 지연 | Max Poll Interval과의 관계 |
+|---|---:|---|
+| c1 | 1초 | 5초보다 짧음 |
+| c2 | 10초 | 5초보다 김 |
+
+```text
+<consumer-id> [bootstrap-servers] [processing-delay-ms]
+```
+
+운영 코드가 컴파일되는지 확인하고 Docker Compose 설정 문법을 검증한다. 현재 테스트 소스가 없으므로 `test` Task 대신 `compileKotlin`을 사용한다.
+
+```bash
+./gradlew compileKotlin
+docker compose config --quiet
+```
+
+c1과 c2를 함께 실행하기 전에 이전 그룹 상태와 Offset의 영향을 받지 않도록 Kafka와 토픽을 초기화한다. Toxiproxy는 Compose에 함께 시작되지만 두 컨슈머 모두 `localhost:9092`를 사용하므로 이번 실험의 통신 경로에는 포함되지 않는다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+```
+
+먼저 c1과 c2를 실행한다. 로그를 파일로 보존해 레코드 출력 수와 파티션 반납 콜백 수를 나중에 다시 계산할 수 있게 했다.
+
+```bash
+# Terminal 1
+./gradlew runConsumer --args="c1 localhost:9092 1000" \
+  | tee /tmp/lab03-ex6-c1-1s.log
+
+# Terminal 2
+./gradlew runConsumer --args="c2 localhost:9092 10000" \
+  | tee /tmp/lab03-ex6-c2-10s.log
+
+# Terminal 3
+./gradlew runAdmin --args="describe-group"
+```
+
+AdminClient에서 그룹이 `Stable`이고 두 멤버가 파티션을 3개씩 소유하는 것을 확인한 다음 지속 프로듀서를 시작한다.
+
+```bash
+# Terminal 4
+python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())'
+./gradlew runProducer --args="continuous"
+```
+
+관찰을 마친 뒤 각 로그의 레코드 출력 수와 파티션 반납 콜백 수를 확인했다. 최초 c2 합류로 발생한 리밸런싱과 느린 처리 중 반복된 리밸런싱은 구분해서 해석한다.
+
+```bash
+grep -c '^processedDate=' /tmp/lab03-ex6-c1-1s.log
+grep -c '^processedDate=' /tmp/lab03-ex6-c2-10s.log
+
+grep -c 'event=partitions_revoked' /tmp/lab03-ex6-c1-1s.log
+grep -c 'event=partitions_revoked' /tmp/lab03-ex6-c2-10s.log
+```
+
+### 실제 출력
+
+#### 1. 실행 조건과 최초 할당
+
+c1은 `processingDelayMs=1000`, c2는 `processingDelayMs=10000`으로 시작했다. 두 컨슈머 모두 Heartbeat 2초, Session Timeout 6초, Max Poll Records 1개와 Max Poll Interval 5초를 적용했다.
+
+![1초 처리 지연으로 시작한 c1과 최초 파티션 할당](images/ex6-c1-1s-startup-and-initial-assignment.png)
+
+![10초 처리 지연으로 시작한 c2와 최초 파티션 할당](images/ex6-c2-10s-startup-and-initial-assignment.png)
+
+두 컨슈머의 최초 할당이 끝난 뒤 그룹은 `Stable`, 멤버 수는 2였다. c1은 파티션 0, 1, 2를, c2는 파티션 3, 4, 5를 소유했다.
+
+![두 컨슈머가 파티션을 3개씩 소유한 최초 Stable 상태](images/ex6-group-stable-two-members.png)
+
+#### 2. c2의 Poll Timeout과 재가입
+
+c2는 한 건을 처리하는 데 10초가 걸려 Max Poll Interval 5초 안에 다음 `poll()`을 호출하지 못했다. 처리를 마친 c2가 다시 `poll()` 경로로 돌아오면 파티션 반납과 재가입이 이어졌고, 약 2초 뒤 파티션 3, 4, 5를 다시 할당받았다.
+
+```text
+processedDate=2026-10-25T09:51:38.545974Z processingDelayMs=10000 consumerId=c2 partition=4 offset=0 ...
+timestamp=2026-10-25T09:51:38.547547Z consumerId=c2 event=partitions_revoked partitions=order-events-3, order-events-4, order-events-5
+timestamp=2026-10-25T09:51:40.611181Z consumerId=c2 event=partitions_assigned partitions=order-events-3, order-events-4, order-events-5
+processedDate=2026-10-25T09:51:50.622572Z processingDelayMs=10000 consumerId=c2 partition=3 offset=0 ...
+timestamp=2026-10-25T09:51:50.623635Z consumerId=c2 event=partitions_revoked partitions=order-events-3, order-events-4, order-events-5
+timestamp=2026-10-25T09:51:52.725735Z consumerId=c2 event=partitions_assigned partitions=order-events-3, order-events-4, order-events-5
+```
+
+![10초 처리 지연 중 파티션 반납과 재할당을 반복한 c2](images/ex6-c2-10s-repeated-rebalances.png)
+
+#### 3. c1까지 영향을 받은 반복 리밸런싱
+
+c2가 그룹에서 빠질 때 c1은 6개 파티션을 모두 할당받았다. c2가 재가입하면 c1은 6개를 반납하고 파티션 0, 1, 2를 다시 할당받았다. 이 변화는 실험이 끝날 때까지 반복됐다.
+
+```text
+timestamp=2026-10-25T09:51:23.486896Z consumerId=c1 event=partitions_revoked partitions=order-events-0, order-events-1, order-events-2
+timestamp=2026-10-25T09:51:23.494249Z consumerId=c1 event=partitions_assigned partitions=order-events-0, order-events-1, order-events-2, order-events-3, order-events-4, order-events-5
+timestamp=2026-10-25T09:51:28.525815Z consumerId=c1 event=partitions_revoked partitions=order-events-0, order-events-1, order-events-2, order-events-3, order-events-4, order-events-5
+timestamp=2026-10-25T09:51:28.532534Z consumerId=c1 event=partitions_assigned partitions=order-events-0, order-events-1, order-events-2
+```
+
+![c2의 이탈과 재가입에 따라 할당 파티션이 반복해서 바뀐 c1](images/ex6-c1-1s-assignment-changes.png)
+
+#### 4. 로그 집계
+
+로그 전체에서 `processedDate`와 `partitions_revoked`를 센 결과는 다음과 같았다.
+
+```text
+c1 레코드 출력:       221
+c2 레코드 출력:        30
+c1 파티션 반납 콜백:    61
+c2 파티션 반납 콜백:    30
+```
+
+![c1과 c2의 레코드 출력 및 파티션 반납 횟수](images/ex6-log-counts.png)
+
+### 결과
+
+| 컨슈머 | 처리 지연 | Max Poll Interval | 레코드 출력 수 | 파티션 반납 콜백 수 | 파티션 할당 변화 | 프로세스 종료 |
+|---|---:|---:|---:|---:|---|---|
+| c1 | 1초 | 5초 | 221 | 61 | 3개 ↔ 6개 반복 | 없음 |
+| c2 | 10초 | 5초 | 30 | 30 | 반납 후 3개 재할당 반복 | 없음 |
+
+파티션 반납 콜백 수는 다음과 같이 해석했다.
+
+| 관찰값 | 의미 |
+|---|---|
+| c2 30회 | 10초 처리로 Poll Timeout이 반복된 주기 수 |
+| c1 최초 1회 | c2가 처음 그룹에 합류할 때 발생한 파티션 반납 |
+| c1 추가 60회 | c2의 30회 이탈과 30회 재가입으로 발생한 파티션 반납 |
+
+`processedDate`는 애플리케이션이 레코드 내용을 출력한 횟수이지, 고유 레코드 수나 Offset Commit 완료 건수가 아니다. `partition:offset`을 기준으로 다시 집계한 결과는 다음과 같았다.
+
+| 컨슈머 | 레코드 출력 수 | 고유 `partition:offset` 수 | 같은 컨슈머 내부의 중복 출력 수 |
+|---|---:|---:|---:|
+| c1 | 221 | 221 | 0 |
+| c2 | 30 | 22 | 8 |
+
+c2가 출력한 고유 `partition:offset` 22개는 모두 c1 로그에도 나타났다. c1 로그에서는 각 파티션의 최초 offset부터 마지막으로 관찰한 offset까지 중간 누락이 없었지만, Producer 발행 총량과 Commit 성공 여부를 함께 기록하지 않았으므로 전체 레코드의 무손실까지 증명한 것은 아니다.
+
+### 해석 및 궁금증
+
+#### 세 설정이 확인하는 상태
+
+| 설정 | 확인 기준 | 이번 실험에서의 역할 |
+|---|---|---|
+| `heartbeat.interval.ms` | 컨슈머가 Heartbeat를 보내는 주기 | 2초 |
+| `session.timeout.ms` | 브로커가 마지막 Heartbeat 이후 기다리는 시간 | 6초 |
+| `max.poll.interval.ms` | 컨슈머에서 연속된 `poll()` 호출 사이에 허용되는 최대 시간 | 5초 |
+
+`max.poll.interval.ms`의 기준은 Offset Commit 완료가 아니라 다음 `poll()` 호출이다. 레코드 처리나 `commitSync()` 같은 작업이 다음 호출을 늦추면 그 시간도 Poll Interval을 소비하지만, Commit 성공 자체가 Poll 타이머를 갱신하지는 않는다.
+
+#### Poll Timeout 감지와 리밸런싱의 주체
+
+브로커는 애플리케이션이 `poll()`을 호출했는지 직접 알 수 없다. 이번 실험의 Dynamic Member에서는 컨슈머 클라이언트가 Poll Timeout을 감지하고 그룹을 떠나며, 브로커의 Group Coordinator가 실제 멤버 관리와 파티션 재할당을 수행한다.
+
+```text
+c2 poll()에서 레코드 1건 반환
+    ↓
+c2가 10초 동안 처리
+    ↓ 5초 경과
+c2 클라이언트가 Poll Timeout 감지 후 LeaveGroup 요청
+    ↓
+브로커가 c2를 제외하고 c1에 파티션 6개 할당
+    ↓ 10초 처리 종료
+c2가 다음 poll()을 호출하며 그룹에 재가입
+    ↓
+브로커가 c1과 c2에 파티션을 3개씩 다시 할당
+```
+
+Experiment 5의 프로세스 강제 종료나 Network 단절처럼 `LeaveGroup` 요청을 보낼 수 없는 상황에서는 이 경로를 사용할 수 없다. 이때는 브로커가 Heartbeat 부재를 `session.timeout.ms`로 판단해 멤버를 제거한다.
+
+#### 애플리케이션 생존과 정상 처리의 차이
+
+- c2 프로세스와 Heartbeat Thread가 실행 중이어도 다음 `poll()`이 늦으면 그룹에서 빠질 수 있다.
+- c2 하나의 느린 처리로 정상 처리 중인 c1도 파티션을 계속 반납하고 재할당받았다.
+- c2가 같은 offset을 반복 출력했으므로 레코드 출력, 처리 완료와 Offset Commit 성공을 같은 의미로 볼 수 없다.
+- 미처리 예외나 프로세스 종료는 관찰되지 않았다. 프로세스가 실행 중이라는 사실만으로 컨슈머 그룹과 레코드 처리가 정상이라고 판단할 수 없다.
+
+#### 설정 변경으로 해결할 때의 한계
+
+- `max.poll.interval.ms`를 레코드 처리, Commit과 부가 작업의 최악 시간보다 충분히 크게 설정하면 Poll Timeout을 피할 수 있다. 그러나 값을 지나치게 늘리면 실제로 멈춘 컨슈머를 감지하고 파티션을 넘기는 시간도 길어진다.
+- `max.poll.records=1`은 한 번에 반환되는 레코드 수를 줄였지만, 한 건의 처리 시간 10초가 Max Poll Interval 5초보다 길었기 때문에 문제를 해결하지 못했다.
+- 처리 시간의 편차가 큰 환경에서는 Poll과 실제 처리를 분리하는 구조가 필요할 수 있다. Offset Commit, 파티션별 순서와 진행 중인 작업 처리는 후속 실험에서 별도로 확인한다.
+
+#### 측정 한계와 남은 질문
+
+| 항목 | 한계 또는 다음 확인 사항 |
+|---|---|
+| 처리량 비교 | 두 컨슈머의 첫 레코드 출력 시각이 약 9초 다르고 중복 offset도 있어, 221대 30을 정확한 초당 처리량이나 고유 처리 건수로 비교할 수 없다. |
+| 리밸런싱 횟수 | 표의 값은 그룹 전체 리밸런싱 횟수가 아니라 각 컨슈머에서 실행된 `partitions_revoked` 콜백 횟수다. |
+| Commit 결과 | 현재 로그에는 Offset Commit 성공과 실패가 기록되지 않아 중복 처리의 정확한 Commit 경계를 확인하지 못했다. |
+| 반복성 | 한 번의 실행 결과이므로 처리 지연과 리밸런싱 횟수의 분포는 확인하지 않았다. |
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임
@@ -935,13 +1148,10 @@ Network 복구부터 c2 재가입으로 발생한 두 번째 리밸런싱까지�
 - 해결: 컨슈머가 시작할 때 자신의 PID를 출력하도록 하고 그 PID에 SIGTERM을 보낸다. SIGTERM 수신 시 `poll()`을 중단하고 컨슈머 실행 스레드에서 `consumer.close()`를 호출하는 종료 처리도 먼저 구현한다.
 - 재발 방지: 종료 전에 PID의 명령이 `lab.kafka.OrderEventConsumerKt c2`인지 확인하며, Gradle Wrapper나 Gradle Daemon PID를 사용하지 않는다.
 
-### Experiment 5 Network 단절 구성 점검
+### Experiment 5에서 Network 단절이 c2에만 적용되지 않는 문제
 
-- c2의 시작 로그에서 `bootstrapServers=localhost:29092`인지 확인한다. `localhost:9092`라면 c2도 Kafka에 직접 연결하므로 Toxiproxy를 비활성화해도 영향을 받지 않는다.
-- Kafka 클라이언트는 Bootstrap Server에서 브로커 메타데이터를 받은 뒤 광고된 주소로 다시 연결한다. `PROXY`의 `advertised.listeners`가 `localhost:9092`를 가리키면 c2가 첫 연결 이후 Toxiproxy를 우회하므로 `PROXY://localhost:29092`로 유지한다.
-- Toxiproxy 컨테이너 안에서 `localhost`는 Kafka가 아니라 Toxiproxy 자신이다. Proxy의 `upstream`은 Compose service 이름을 사용해 `kafka:29093`으로 설정한다.
-- Toxiproxy를 비활성화했을 때 c1까지 끊긴다면 c1이 `localhost:29092`를 사용하고 있거나 Kafka 컨테이너 또는 공통 Docker Network를 중단한 것이다. c1, Producer와 AdminClient는 `localhost:9092`의 `DIRECT` 경로를 유지한다.
-- `depends_on`은 컨테이너 시작 순서만 보장한다. Kafka 준비 전에 Topic 생성이 실패하면 `docker compose ps`와 `docker compose logs kafka`로 브로커 상태를 확인한 뒤 명령을 다시 실행한다.
-- Toxiproxy API는 인증 없이 Proxy 상태를 변경할 수 있으므로 `8474`와 c2 접속용 `29092`는 `127.0.0.1`에만 bind한다.
-
-## Key Takeaways
+- 증상: Toxiproxy를 비활성화해도 c2가 계속 레코드를 처리하거나, 반대로 c1과 다른 클라이언트까지 Kafka 연결이 끊긴다.
+- 원인: c2가 `localhost:9092`에 직접 연결했거나, Kafka가 광고한 `PROXY` 주소가 Toxiproxy를 우회하도록 설정됐거나, Proxy의 `upstream`이 컨테이너 내부의 잘못된 주소를 가리켰다. Kafka 컨테이너나 공통 Docker Network를 중단한 경우에도 모든 클라이언트가 함께 영향을 받는다.
+- 해결: c1, Producer와 AdminClient는 `localhost:9092`의 `DIRECT` listener를 사용하고, c2만 `localhost:29092`의 Toxiproxy를 사용한다. Kafka의 광고 주소는 `PROXY://localhost:29092`, Proxy의 `upstream`은 Compose service 이름을 사용한 `kafka:29093`으로 설정한다.
+- 확인: c1 시작 로그의 `bootstrapServers`는 `localhost:9092`, c2는 `localhost:29092`인지 확인한다. Proxy 비활성화 후에는 c2 프로세스가 살아 있지만 c1이 6개 파티션을 다시 할당받아야 하며, Proxy 복구 후에는 c2가 그룹에 재가입해야 한다.
+- 재발 방지: Toxiproxy 제어 API `8474`와 c2 접속 Port `29092`는 `127.0.0.1`에만 bind한다. `depends_on`은 시작 순서만 보장하므로 Topic 생성이 실패하면 `docker compose ps`와 `docker compose logs kafka`로 Kafka 준비 상태를 확인한다.

@@ -17,3 +17,5 @@ kafka:
     auto-offset-reset: earliest
     heartbeat-interval-ms: 2000
     session-timeout-ms: 6000
+    max-poll-records: 1
+    max-poll-interval-ms: 5000

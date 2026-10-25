@@ -29,4 +29,6 @@ data class ConsumerConfig(
     val autoOffsetReset: String,
     val heartbeatIntervalMs: Int,
     val sessionTimeoutMs: Int,
+    val maxPollRecords: Int,
+    val maxPollIntervalMs: Int
 )
