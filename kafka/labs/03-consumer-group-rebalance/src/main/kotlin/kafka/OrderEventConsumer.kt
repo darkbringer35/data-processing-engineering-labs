@@ -14,8 +14,8 @@ import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
 
 fun main(args: Array<String>) {
-    require(args.size in 1..5) {
-        "Usage: <consumer-id> [bootstrap-servers] [processing-delay-ms] [group-id] [assignor]"
+    require(args.size in 1..6) {
+        "Usage: <consumer-id> [bootstrap-servers] [processing-delay-ms] [group-id] [assignor] [group-instance-id]"
     }
 
     val config = KafkaConfigLoader.load().kafka
@@ -26,9 +26,14 @@ fun main(args: Array<String>) {
     val groupId = args.getOrNull(3) ?: config.consumer.groupId
     val assignor = args.getOrNull(4)
     val assignmentStrategyClassName = resolveAssignmentStrategy(assignor)
+    val groupInstanceId = args.getOrNull(5)
 
     require(groupId.isNotBlank()) {
         "Group ID must not be blank."
+    }
+
+    require(groupInstanceId == null || groupInstanceId.isNotBlank()) {
+        "Group instance ID must not be blank."
     }
 
     require(processingDelayMs >= 0) {
@@ -48,6 +53,9 @@ fun main(args: Array<String>) {
         put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, config.consumer.maxPollIntervalMs)
         assignmentStrategyClassName?.let {
             put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, it)
+        }
+        groupInstanceId?.let {
+            put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, it)
         }
     }
 
@@ -72,6 +80,7 @@ fun main(args: Array<String>) {
         "pid=$pid bootstrapServers=$bootstrapServers " +
             "groupId=$groupId " +
             "assignor=${assignor ?: "default"} " +
+            "groupInstanceId=${groupInstanceId ?: "dynamic"} " +
             "heartbeatIntervalMs=${config.consumer.heartbeatIntervalMs} " +
             "sessionTimeoutMs=${config.consumer.sessionTimeoutMs} " +
             "maxPollRecords=${config.consumer.maxPollRecords} " +

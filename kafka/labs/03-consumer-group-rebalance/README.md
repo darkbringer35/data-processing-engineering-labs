@@ -1433,6 +1433,287 @@ c2: [cooperative-sticky, range]
 
 결론적으로 Assignor를 비교할 때는 최종 파티션 개수만 확인해서는 부족하다. `얼마나 균등한가`, `몇 개의 소유자가 바뀌는가`, `리밸런싱 중 몇 개를 멈추는가`, `인계 시 Offset과 상태를 어떻게 안전하게 저장하는가`를 별도로 확인해야 한다.
 
+## Experiment 8. Static Membership
+
+### 목적
+
+- `group.instance.id`를 사용한 Static Membership이 컨슈머 재시작 과정에 미치는 영향을 확인한다.
+- Dynamic Member와 Static Member의 파티션 이동량 및 계속 실행 중인 c1의 리밸런싱 콜백을 비교한다.
+- Session Timeout 안에 복귀한 경우와 Timeout 이후 복귀한 경우를 구분한다.
+- 같은 Instance ID를 두 프로세스가 동시에 사용했을 때의 fencing 동작을 확인한다.
+
+### 명령어
+
+컨슈머 실행 인자의 마지막에 선택적인 `group-instance-id`를 추가했다. 이 값을 생략하면 Dynamic Member, 지정하면 Static Member로 실행된다.
+
+```text
+<consumer-id> [bootstrap-servers] [processing-delay-ms] [group-id] [assignor] [group-instance-id]
+```
+
+`group.instance.id`는 같은 그룹 안에서 고유해야 하지만, 같은 인스턴스를 재시작할 때는 이전과 같은 값을 사용해야 한다. 공통 `application.yml`에 넣으면 모든 프로세스가 같은 값을 사용할 수 있으므로 실행 인자로 받았다. Admin 출력에는 실제 등록된 Instance ID를 추가했다.
+
+빠른 재시작을 수동으로 수행할 수 있도록 Session Timeout을 15초로 설정했다.
+
+```yaml
+kafka:
+  consumer:
+    heartbeat-interval-ms: 2000
+    session-timeout-ms: 15000
+    max-poll-records: 1
+    max-poll-interval-ms: 5000
+```
+
+코드와 Compose 설정을 검증하고 Kafka, 토픽과 지속 프로듀서를 준비했다.
+
+```bash
+./gradlew compileKotlin
+docker compose config --quiet
+
+docker compose down
+docker compose up -d
+./gradlew --quiet runAdmin --args="create-topic 6"
+./gradlew --quiet runProducer --args="continuous" \
+  2>&1 | tee /tmp/lab03-ex8-producer.log
+```
+
+#### Dynamic Member
+
+`group-instance-id`를 생략하고 c1과 c2를 실행했다.
+
+```bash
+./gradlew --quiet runConsumer --args="c1 localhost:9092 0 lab03-ex8-dynamic cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex8-dynamic-c1.log
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-dynamic cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex8-dynamic-c2-first.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-dynamic" \
+  | tee /tmp/lab03-ex8-dynamic-before-restart.log
+```
+
+c2 터미널에서 `Ctrl+C`를 누른 뒤 그룹이 c1 하나로 안정화된 상태를 저장하고 c2를 재실행했다.
+
+```bash
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-dynamic" \
+  | tee /tmp/lab03-ex8-dynamic-c2-stopped.log
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-dynamic cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex8-dynamic-c2-restarted.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-dynamic" \
+  | tee /tmp/lab03-ex8-dynamic-after-restart.log
+
+grep -h -E 'event=partitions_(revoked|assigned)' \
+  /tmp/lab03-ex8-dynamic-c1.log \
+  /tmp/lab03-ex8-dynamic-c2-first.log \
+  /tmp/lab03-ex8-dynamic-c2-restarted.log \
+  | sort | tee /tmp/lab03-ex8-dynamic-rebalance-events.log
+```
+
+#### Static Member가 Session Timeout을 넘긴 경우
+
+c1과 c2에 서로 다른 Instance ID를 지정했다.
+
+```bash
+./gradlew --quiet runConsumer --args="c1 localhost:9092 0 lab03-ex8-static cooperative-sticky instance-c1" \
+  2>&1 | tee /tmp/lab03-ex8-static-c1.log
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-static cooperative-sticky instance-c2" \
+  2>&1 | tee /tmp/lab03-ex8-static-c2-first.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static" \
+  | tee /tmp/lab03-ex8-static-before-restart.log
+```
+
+c2를 중단한 직후에는 할당이 유지되는지 확인하고, 18초를 기다려 Session Timeout이 지난 뒤 다시 조회했다. 이후 같은 `instance-c2`로 c2를 재실행했다.
+
+```bash
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static" \
+  | tee /tmp/lab03-ex8-static-within-stopped.log
+
+sleep 18
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static" \
+  | tee /tmp/lab03-ex8-static-timeout-expired.log
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-static cooperative-sticky instance-c2" \
+  2>&1 | tee /tmp/lab03-ex8-static-c2-after-timeout.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static" \
+  | tee /tmp/lab03-ex8-static-after-timeout-restart.log
+```
+
+#### Static Member가 Session Timeout 안에 복귀한 경우
+
+실패한 수동 재시도와 로그가 섞이지 않도록 `lab03-ex8-static-quick` 그룹을 새로 사용했다. c1과 c2를 실행해 최초 할당을 저장한 다음, 시작 로그에서 확인한 실제 c2 JVM PID에 `SIGTERM`을 보냈다. 재시작 명령을 다른 터미널에 미리 준비해 15초 안에 같은 `instance-c2`로 복귀시켰다.
+
+```bash
+./gradlew --quiet runConsumer --args="c1 localhost:9092 0 lab03-ex8-static-quick cooperative-sticky instance-c1" \
+  2>&1 | tee /tmp/lab03-ex8-static-quick-c1.log
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-static-quick cooperative-sticky instance-c2" \
+  2>&1 | tee /tmp/lab03-ex8-static-quick-c2-first.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static-quick" \
+  | tee /tmp/lab03-ex8-static-quick-before.log
+
+kill -TERM <c2-pid>
+
+./gradlew --quiet runConsumer --args="c2 localhost:9092 0 lab03-ex8-static-quick cooperative-sticky instance-c2" \
+  2>&1 | tee /tmp/lab03-ex8-static-quick-c2-restarted.log
+
+./gradlew --quiet runAdmin --args="describe-group lab03-ex8-static-quick" \
+  | tee /tmp/lab03-ex8-static-quick-after.log
+
+grep -h -E 'event=(shutdown_requested|consumer_started|partitions_revoked|partitions_assigned)' \
+  /tmp/lab03-ex8-static-quick-c1.log \
+  /tmp/lab03-ex8-static-quick-c2-first.log \
+  /tmp/lab03-ex8-static-quick-c2-restarted.log \
+  | sort | tee /tmp/lab03-ex8-static-quick-events.log
+```
+
+#### 동일 Instance ID 중복 실행
+
+`instance-c2`가 실행 중일 때 다른 `client.id`로 같은 Instance ID를 사용했다.
+
+```bash
+./gradlew --quiet runConsumer \
+  --args="c2-duplicate localhost:9092 0 lab03-ex8-static cooperative-sticky instance-c2" \
+  2>&1 | tee /tmp/lab03-ex8-static-duplicate-instance.log
+
+grep -H -E 'FencedInstanceIdException|event=(consumer_started|consumer_close)' \
+  /tmp/lab03-ex8-static-{c2-within-retry,duplicate-instance}.log \
+  | tee /tmp/lab03-ex8-static-duplicate-result.log
+```
+
+### 실제 출력
+
+#### 1. Dynamic Member 종료와 재가입
+
+최초에는 c1과 c2가 파티션을 3개씩 소유했고 `groupInstanceId`는 `-`로 출력됐다.
+
+![Dynamic Member 2명의 최초 할당](images/ex8-dynamic-before-restart.png)
+
+c2가 제거된 뒤 c1은 파티션 6개를 모두 소유했다. c2가 다시 가입하자 c1은 3, 4, 5를 반납하고 c2가 다시 소유했다.
+
+![Dynamic c2 제거 후 c1의 전체 파티션 할당](images/ex8-dynamic-after-c2-exit.png)
+
+![Dynamic c2 재가입 후 할당](images/ex8-dynamic-after-restart.png)
+
+![Dynamic c2 종료와 재가입 과정의 콜백](images/ex8-dynamic-rebalance-events.png)
+
+#### 2. Static Member의 할당 유지와 Session Timeout
+
+Static Group에서는 c1이 `instance-c1`, c2가 `instance-c2`로 등록됐다.
+
+![Static Member 2명의 최초 할당](images/ex8-static-before-restart.png)
+
+c2 프로세스가 중단된 뒤에도 Session Timeout 전에는 멤버 수가 2였고 c2의 파티션 3, 4, 5도 그대로 유지됐다.
+
+![Static c2 중단 후 Session Timeout 전까지 유지된 할당](images/ex8-static-assignment-held-before-timeout.png)
+
+15초가 지나자 c2가 그룹에서 제거되고 c1이 파티션 6개를 소유했다. 이후 같은 `instance-c2`가 재가입하자 다시 3개씩 분배됐다.
+
+![Static c2의 Session Timeout 이후 c1의 전체 파티션 할당](images/ex8-static-after-session-timeout.png)
+
+![Session Timeout 이후 Static c2 재가입](images/ex8-static-after-timeout-restart.png)
+
+#### 3. Static Member의 15초 이내 재시작
+
+빠른 재시작 전후 모두 c1은 0, 1, 2를, c2는 3, 4, 5를 소유했다. c2의 `memberId`는 바뀌었지만 `groupInstanceId=instance-c2`와 할당은 유지됐다.
+
+![15초 이내 재시작 전 Static 할당](images/ex8-static-quick-before-restart.png)
+
+![15초 이내 재시작 후 유지된 Static 할당](images/ex8-static-quick-after-restart.png)
+
+로그에서 c2의 종료 요청부터 새 프로세스 시작까지는 약 8.077초였다. 이 구간에 c1의 추가 콜백은 없었고, 새 c2는 파티션 3, 4, 5를 바로 할당받았다.
+
+```text
+2026-10-25T12:28:42.420339Z c2 shutdown_requested
+2026-10-25T12:28:42.427791Z c2 partitions_revoked [3, 4, 5]
+2026-10-25T12:28:50.497484Z c2 consumer_started
+2026-10-25T12:28:50.795235Z c2 partitions_assigned [3, 4, 5]
+```
+
+![15초 이내 Static 재시작의 종료 및 할당 콜백](images/ex8-static-quick-events.png)
+
+#### 4. 중복 Instance ID의 fencing
+
+기존 c2가 `instance-c2`를 사용 중일 때 `c2-duplicate`가 같은 ID로 가입했다. 새 프로세스가 파티션 3, 4, 5를 할당받고, 기존 c2에는 `FencedInstanceIdException`이 발생해 종료됐다.
+
+이때 Kafka가 기존 JVM 프로세스를 직접 종료하는 것은 아니다. Group Coordinator는 기존 컨슈머를 fencing해 더 이상 정상적인 그룹 멤버로 동작하지 못하게 하고, 기존 프로세스는 다음 그룹 요청에서 `FencedInstanceIdException`을 받는다. 이번 Consumer 코드는 이 예외를 복구하지 않으므로 실행이 종료됐다.
+
+```text
+2026-10-25T12:23:29.269416Z c2-duplicate consumer_started groupInstanceId=instance-c2
+2026-10-25T12:23:29.945343Z c2 consumer_close_started
+2026-10-25T12:23:30.046204Z c2 consumer_close_completed
+FencedInstanceIdException: another consumer with the same group.instance.id has registered
+```
+
+![동일 Instance ID를 사용한 기존 c2의 fencing](images/ex8-static-duplicate-instance-fenced.png)
+
+### 결과
+
+`이동 수`는 c2가 소유하던 3개 파티션의 논리적 소유자가 바뀐 수다. `레코드 출력 공백`은 파티션 3, 4, 5 중 마지막 출력부터 인계 후 최초 출력까지의 관찰값이며, 파티션별 정확한 처리 중단 시간과는 다르다.
+
+| 조건 | c2 중단 시 이동 / 재가입 시 이동 | 계속 실행된 c1의 콜백 | 재시작 또는 대기 시간 | 레코드 출력 공백 |
+|---|---:|---|---:|---:|
+| Dynamic | 3 / 3 | c2 제거 시 Assigned, 재가입 시 Revoked/Assigned | 정확한 종료 시각 없음 | 약 2.748초 |
+| Static, Timeout 안에 복귀 | 0 / 0 | 추가 콜백 없음 | 약 8.077초 | 약 8.446초 |
+| Static, Timeout 이후 복귀 | 3 / 3 | Timeout 시 Assigned, 재가입 시 Revoked/Assigned | 15초 초과 | 약 16.312초 |
+
+Static 빠른 재시작에서 파티션의 소유자는 `instance-c2`로 유지됐지만 실제 JVM 프로세스는 교체됐다. 따라서 이동 수 0은 Group Coordinator 관점의 할당 유지이며, 이전 프로세스의 메모리 상태가 새 프로세스로 보존됐다는 뜻은 아니다.
+
+| 중복 Instance ID 관찰값 | 결과 |
+|---|---|
+| 기존 멤버 | `FencedInstanceIdException` 발생 후 종료 |
+| 새 멤버 | `instance-c2`로 파티션 3, 4, 5 할당 |
+| c1 | 추가 파티션 반납·할당 없음 |
+
+### 해석 및 궁금증
+
+#### Static Membership이 줄여준 것
+
+Dynamic Member는 재가입할 때 새로운 멤버로 취급됐다. c2가 사라지면 파티션 3, 4, 5가 c1으로 이동하고, c2가 돌아오면 같은 파티션이 다시 c2로 이동했다.
+
+Static Member는 `memberId`가 바뀌어도 같은 `group.instance.id`로 Session Timeout 안에 돌아오면 기존 논리적 멤버로 인식됐다. 이번 빠른 재시작에서는 c1의 할당과 콜백이 전혀 바뀌지 않았으므로, 이동하지 않는 파티션까지 리밸런싱에 참여시키는 비용을 피했다.
+
+여기서 "Session Timeout 동안 유지된다"는 것은 프로세스를 종료한 순간부터 정확히 15초를 보장한다는 뜻이 아니다. Group Coordinator가 받은 마지막 정상 heartbeat부터 `session.timeout.ms`가 지날 때까지 해당 `group.instance.id`의 멤버 자리와 파티션 할당을 유지한다는 뜻이다. 따라서 프로세스 중단 시점부터 실제 만료까지의 시간은 마지막 heartbeat 시점에 따라 조금 달라질 수 있다.
+
+이 특성은 Rolling Restart 중 파티션별 캐시와 상태의 소유 위치를 안정적으로 유지하는 데 유리하다. 다만 프로세스 메모리는 재시작과 함께 사라지므로, Static Membership 자체가 로컬 상태를 복원해 주지는 않는다. 동일한 Instance ID가 같은 디스크나 상태 저장소를 다시 사용하도록 배포 환경도 함께 설계해야 한다.
+
+#### Static Membership이 줄여주지 못한 것
+
+Static Membership은 c2가 멈춘 동안 파티션 3, 4, 5를 다른 컨슈머에게 넘기지 않았다. 따라서 그룹 리밸런싱은 없었지만 해당 파티션의 레코드 출력은 약 8.446초간 멈췄다. `리밸런싱 없음`과 `처리 중단 없음`은 같은 의미가 아니다.
+
+Session Timeout 15초가 지나자 Static Member도 제거됐고 Dynamic Member와 마찬가지로 파티션이 c1으로 이동했다. 새로운 Instance ID의 합류, 구독 토픽 변경과 실제 멤버 제거처럼 할당을 바꿔야 하는 사건도 Static Membership만으로 피할 수 없다.
+
+#### 빠른 복구와 불필요한 리밸런싱 방지의 교환
+
+Session Timeout을 길게 잡으면 배포나 짧은 일시 장애에서 기존 할당을 유지할 가능성이 높아진다. 반면 인스턴스가 실제로 복구되지 않을 때는 다른 컨슈머가 파티션을 인계받는 시점도 늦어진다.
+
+```text
+Session Timeout 안에 복귀
+→ 기존 할당 유지
+→ c1 리밸런싱 없음
+→ c2의 파티션은 재시작 시간 동안 처리되지 않음
+
+Session Timeout 안에 복귀하지 않음
+→ Timeout까지 c2의 자리 유지
+→ Timeout 후 c1으로 파티션 이동
+→ c2 재가입 시 다시 파티션 이동
+```
+
+따라서 운영값은 일반적인 배포 재시작 시간보다 충분히 길면서, 허용 가능한 장애 복구 시간보다는 짧아야 한다. 배포가 느리다는 이유만으로 Session Timeout을 계속 늘리면 실제 장애의 Consumer Lag도 그만큼 길어질 수 있다.
+
+#### Instance ID의 운영 규칙
+
+- Instance ID는 같은 그룹 안에서 동시에 실행되는 프로세스마다 고유해야 한다.
+- 재시작한 동일 인스턴스는 이전과 같은 ID를 사용해야 한다.
+- Kubernetes에서는 무작위 Pod 이름보다 StatefulSet ordinal처럼 재시작 후에도 유지되는 ID가 적합하다.
+- Rolling Deployment 중 구버전과 신버전이 같은 ID로 동시에 실행되면 이번 실험처럼 기존 프로세스가 fenced될 수 있다.
+
+`client.id`는 로그와 메트릭에서 클라이언트를 구분하는 이름이고, `group.instance.id`는 Consumer Group에서 논리적 멤버의 동일성을 결정한다. 둘을 같은 목적으로 사용해서는 안 된다.
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임

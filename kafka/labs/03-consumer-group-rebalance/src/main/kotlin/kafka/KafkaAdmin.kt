@@ -101,6 +101,7 @@ private fun describeConsumerGroup(admin: Admin, groupId: String) {
                 }
 
             println("    - clientId: ${member.clientId()}")
+            println("      groupInstanceId: ${member.groupInstanceId().orElse("-")}")
             println("      memberId: ${member.consumerId()}")
             println("      host: ${member.host()}")
             println("      partitions: $partitions")
