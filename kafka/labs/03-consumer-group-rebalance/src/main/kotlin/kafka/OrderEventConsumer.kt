@@ -4,14 +4,17 @@ import lab.kafka.config.KafkaConfigLoader
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.CooperativeStickyAssignor
 import org.apache.kafka.clients.consumer.KafkaConsumer
+import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.clients.consumer.RangeAssignor
 import org.apache.kafka.clients.consumer.RoundRobinAssignor
 import org.apache.kafka.clients.consumer.StickyAssignor
-import org.apache.kafka.common.errors.WakeupException
+import org.apache.kafka.common.TopicPartition
 import java.time.Duration
 import java.time.Instant
 import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
+
+private const val COMMIT_DELAY_ENV = "LAB_COMMIT_DELAY_MS"
 
 fun main(args: Array<String>) {
     require(args.size in 1..6) {
@@ -27,6 +30,11 @@ fun main(args: Array<String>) {
     val assignor = args.getOrNull(4)
     val assignmentStrategyClassName = resolveAssignmentStrategy(assignor)
     val groupInstanceId = args.getOrNull(5)
+    val commitDelayMs = System.getenv(COMMIT_DELAY_ENV)?.let { input ->
+        requireNotNull(input.toLongOrNull()) {
+            "$COMMIT_DELAY_ENV must be an integer: $input"
+        }
+    } ?: 0L
 
     require(groupId.isNotBlank()) {
         "Group ID must not be blank."
@@ -40,6 +48,10 @@ fun main(args: Array<String>) {
         "Processing delay must be zero or greater."
     }
 
+    require(commitDelayMs >= 0) {
+        "$COMMIT_DELAY_ENV must be zero or greater."
+    }
+
     val props = Properties().apply {
         put("client.id", consumerId)
         put("bootstrap.servers", bootstrapServers)
@@ -51,6 +63,7 @@ fun main(args: Array<String>) {
         put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, config.consumer.sessionTimeoutMs)
         put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, config.consumer.maxPollRecords)
         put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, config.consumer.maxPollIntervalMs)
+        put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false)
         assignmentStrategyClassName?.let {
             put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, it)
         }
@@ -69,7 +82,6 @@ fun main(args: Array<String>) {
             logLifecycle(consumerId, "shutdown_requested", "pid=$pid")
         }
 
-        consumer.wakeup()
         consumerThread.join()
     }, "consumer-shutdown-$consumerId")
 
@@ -85,7 +97,8 @@ fun main(args: Array<String>) {
             "sessionTimeoutMs=${config.consumer.sessionTimeoutMs} " +
             "maxPollRecords=${config.consumer.maxPollRecords} " +
             "maxPollIntervalMs=${config.consumer.maxPollIntervalMs} " +
-            "processingDelayMs=$processingDelayMs"
+            "processingDelayMs=$processingDelayMs " +
+            "commitDelayMs=$commitDelayMs"
     )
 
     try {
@@ -98,6 +111,23 @@ fun main(args: Array<String>) {
             val records = consumer.poll(Duration.ofSeconds(1))
 
             for (record in records) {
+                if (shutdownRequested.get()) {
+                    logLifecycle(
+                        consumerId,
+                        "record_rejected_after_shutdown",
+                        "topic=${record.topic()} partition=${record.partition()} offset=${record.offset()}"
+                    )
+                    break
+                }
+
+                val recordDetail =
+                    "topic=${record.topic()} " +
+                        "partition=${record.partition()} " +
+                        "offset=${record.offset()} " +
+                        "key=${record.key()}"
+
+                logLifecycle(consumerId, "processing_started", recordDetail)
+
                 Thread.sleep(processingDelayMs)
 
                 val processedDate = Instant.now()
@@ -111,11 +141,30 @@ fun main(args: Array<String>) {
                         "key=${record.key()} " +
                         "value=${record.value()}"
                 )
+
+                logLifecycle(consumerId, "processing_completed", recordDetail)
+
+                Thread.sleep(commitDelayMs)
+
+                logLifecycle(
+                    consumerId,
+                    "offset_commit_started",
+                    "$recordDetail nextOffset=${record.offset() + 1}"
+                )
+
+                consumer.commitSync(
+                    mapOf(
+                        TopicPartition(record.topic(), record.partition()) to
+                            OffsetAndMetadata(record.offset() + 1)
+                    )
+                )
+
+                logLifecycle(
+                    consumerId,
+                    "offset_commit_completed",
+                    "$recordDetail nextOffset=${record.offset() + 1}"
+                )
             }
-        }
-    } catch (exception: WakeupException) {
-        if (!shutdownRequested.get()) {
-            throw exception
         }
     } finally {
         logLifecycle(consumerId, "consumer_close_started")

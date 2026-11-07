@@ -1379,7 +1379,7 @@ c3: assigned [2, 5]
 - Kafka 입출력을 함께 묶을 수 있다면 Transaction과 `read_committed`를 검토한다.
 - DB 같은 외부 시스템과 함께 처리하면 고유 이벤트 ID, Unique Constraint 또는 처리 이력으로 중복을 방어한다.
 
-이번 코드의 `RebalanceLoggingListener`는 콜백을 출력할 뿐 Offset을 직접 Commit하거나 파티션 상태를 저장하지 않는다. 컨슈머도 `enable.auto.commit`을 명시하지 않아 Kafka Client 기본값인 Auto Commit을 사용한다. 따라서 이번 캡처로 확인한 것은 반납 및 할당 범위이며, 중복·유실이나 처리 결과의 원자성은 검증하지 않았다.
+Experiment 7 실행 당시 `RebalanceLoggingListener`는 콜백을 출력할 뿐 Offset을 직접 Commit하거나 파티션 상태를 저장하지 않았다. 컨슈머도 `enable.auto.commit`을 명시하지 않아 Kafka Client 기본값인 Auto Commit을 사용했다. 따라서 해당 캡처로 확인한 것은 반납 및 할당 범위이며, 중복·유실이나 처리 결과의 원자성은 검증하지 않았다.
 
 #### CooperativeSticky의 빈 Assigned 콜백
 
@@ -1713,6 +1713,203 @@ Session Timeout 안에 복귀하지 않음
 - Rolling Deployment 중 구버전과 신버전이 같은 ID로 동시에 실행되면 이번 실험처럼 기존 프로세스가 fenced될 수 있다.
 
 `client.id`는 로그와 메트릭에서 클라이언트를 구분하는 이름이고, `group.instance.id`는 Consumer Group에서 논리적 멤버의 동일성을 결정한다. 둘을 같은 목적으로 사용해서는 안 된다.
+
+## Experiment 9. Graceful Shutdown and In-flight Drain
+
+### 목적
+
+- Auto Commit을 끄고 레코드 처리 완료, Offset Commit과 Consumer Close의 순서를 확인한다.
+- 유휴 상태, 레코드 처리 중과 Drain 제한 시간 초과 상태에서 SIGTERM 이후 동작을 비교한다.
+- 처리 완료 후 Commit 전에 강제 종료됐을 때 같은 파티션과 Offset이 다시 처리되는지 확인한다.
+
+### 명령어
+
+`processing-delay-ms`는 처리 완료 전 지연이고, `LAB_COMMIT_DELAY_MS`는 처리 완료 후 Offset Commit 전 지연이다. 후자는 Drain 제한 시간 초과를 재현할 때만 사용한다.
+
+Kafka와 100개 레코드를 새로 준비한다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew --quiet runAdmin --args="create-topic 6"
+./gradlew --quiet runProducer 2>&1 | tee /tmp/lab03-ex9-producer.log
+```
+
+유휴 상태에서는 모든 레코드를 처리한 뒤 시작 로그의 Consumer JVM PID에 SIGTERM을 보낸다.
+
+```bash
+./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 0 lab03-ex9-idle cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex9-idle.log
+
+grep -c 'processedDate=' /tmp/lab03-ex9-idle.log
+kill -TERM <consumer-jvm-pid>
+```
+
+처리 중 종료는 `processing_started` 직후 SIGTERM을 보낸 뒤, 같은 Group으로 재시작한다. 처리 지연 3초는 `max.poll.interval.ms=5000`보다 짧게 둔다.
+
+```bash
+./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 3000 lab03-ex9-processing cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex9-processing-first.log
+
+kill -TERM <consumer-jvm-pid>
+
+./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 0 lab03-ex9-processing cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex9-processing-restarted.log
+```
+
+Drain 제한 시간 초과는 처리 완료 후 Commit을 10초 지연한다. `processing_completed`를 확인한 뒤 SIGTERM을 보내고, 3초 뒤에도 살아 있는 Consumer JVM에 SIGKILL을 보내 Commit 시도 전에 강제로 종료한다.
+
+```bash
+LAB_COMMIT_DELAY_MS=10000 ./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 0 lab03-ex9-timeout cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex9-timeout-first.log
+
+kill -TERM <consumer-jvm-pid>
+sleep 3
+kill -KILL <consumer-jvm-pid>
+
+sleep 16
+./gradlew --quiet runConsumer \
+  --args="c1 localhost:9092 0 lab03-ex9-timeout cooperative-sticky" \
+  2>&1 | tee /tmp/lab03-ex9-timeout-restarted.log
+```
+
+각 조건의 이벤트 순서와 같은 파티션·Offset의 재처리 여부를 비교한다.
+
+```bash
+grep -h -E 'event=(processing_started|processing_completed|offset_commit_started|offset_commit_completed|shutdown_requested|record_rejected_after_shutdown|consumer_close_started|consumer_close_completed)' \
+  /tmp/lab03-ex9-*.log
+```
+
+각 종료와 재시작 전후에는 브로커에 저장된 파티션별 `CURRENT-OFFSET`도 확인한다.
+
+```bash
+docker exec lab03-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe --group <group-id>
+```
+
+### 실제 출력
+
+#### 1. 유휴 상태 종료
+
+100개 레코드의 처리를 마치고 SIGTERM을 보냈다. 마지막 레코드의 Offset Commit 이후 새 레코드를 처리하지 않았고, 종료 요청부터 약 0.933초 뒤 `consumer_close_completed`가 기록됐다.
+
+```text
+13:21:46.220739 offset_commit_completed partition=0 offset=11 nextOffset=12
+13:22:10.355891 shutdown_requested
+13:22:11.251599 consumer_close_started
+13:22:11.254662 partitions_revoked [0, 1, 2, 3, 4, 5]
+13:22:11.288703 consumer_close_completed
+```
+
+![유휴 상태에서 SIGTERM 이후 정상 종료](images/ex9-idle-graceful-shutdown.png)
+
+종료 후 각 파티션의 `CURRENT-OFFSET`은 `LOG-END-OFFSET`과 같았고 Lag은 모두 0이었다.
+
+```text
+partition 0: 12 / 12    partition 3: 27 / 27
+partition 1:  6 /  6    partition 4: 26 / 26
+partition 2: 20 / 20    partition 5:  9 /  9
+```
+
+#### 2. 처리 중 종료
+
+처리 지연 3초를 적용한 상태에서 파티션 4의 Offset 3을 처리하는 도중 SIGTERM을 보냈다. 종료 요청 이후 해당 레코드의 처리를 마치고 다음 Offset 4를 Commit한 뒤 약 0.310초 만에 Consumer Close를 완료했다.
+
+```text
+13:23:47.862547 processing_started partition=4 offset=3
+13:23:50.598566 shutdown_requested
+13:23:50.863686 processing_completed partition=4 offset=3
+13:23:50.863840 offset_commit_started partition=4 nextOffset=4
+13:23:50.872418 offset_commit_completed partition=4 nextOffset=4
+13:23:50.872727 consumer_close_started
+13:23:50.908613 consumer_close_completed
+```
+
+![처리 중 SIGTERM 이후 레코드 처리와 Offset Commit 완료](images/ex9-inflight-record-drained-before-close.png)
+
+같은 Group으로 재시작하자 파티션 4는 Offset 3이 아니라 Offset 4부터 처리했다. 첫 실행 13개와 재시작 후 87개를 합친 100개의 파티션·Offset은 모두 고유했다.
+
+![Commit된 다음 Offset부터 처리한 재시작 Consumer](images/ex9-restart-from-committed-offset.png)
+
+#### 3. Drain 제한 시간 초과
+
+파티션 5의 Offset 0 처리를 완료한 뒤 Commit만 10초 지연했다. 이 구간에 SIGTERM을 보내고 3초 후 SIGKILL했으므로 `offset_commit_started`와 `consumer_close_completed`는 기록되지 않았다.
+
+```text
+14:14:34.553429 processing_started partition=5 offset=0
+14:14:34.558952 processing_completed partition=5 offset=0
+14:14:36.674506 shutdown_requested
+```
+
+![처리 완료 후 Offset Commit 전 Drain 제한 시간 초과](images/ex9-drain-timeout-before-offset-commit.png)
+
+같은 Group으로 재시작하자 동일한 Event ID와 `partition=5 offset=0`이 다시 전달됐다. 재처리 후에는 `nextOffset=1` Commit이 완료됐다.
+
+```text
+eventId=5db162c0-cee4-433f-bef1-d56c718a8e4a
+partition=5 offset=0
+offset_commit_completed nextOffset=1
+```
+
+![Commit되지 않은 동일 Offset의 재처리](images/ex9-restart-reprocesses-uncommitted-offset.png)
+
+### 결과
+
+| 종료 조건 | 신규 작업 수락 | Drain 시간 | 최종 Commit Offset | 재시작 중복 | 누락 |
+|---|---:|---:|---|---:|---:|
+| 유휴 상태 | 0 | 약 0.933초 | 100개 전체, Lag 0 | 재시작하지 않음 | 0 |
+| 처리 중 | 0, in-flight 1개 완료 | 약 0.310초 | 대상 파티션 4의 `nextOffset=4` | 0 | 0 |
+| Drain 제한 시간 초과 | 0, 처리 완료 1개 미Commit | 3초 후 SIGKILL, 미완료 | 첫 실행 없음, 재시작 후 `nextOffset=1` | 1 | 0 |
+
+처리 중 종료는 첫 실행 13개와 재시작 87개를 합쳐 100개의 고유한 파티션·Offset을 처리했다. Drain 제한 시간 초과는 첫 실행 1개와 재시작 100개로 총 101회 처리됐으며, 고유한 파티션·Offset은 100개였다. 중복은 `order-events-5-0` 한 건이었다.
+
+### 해석 및 궁금증
+
+#### Shutdown Hook만으로 충분하지 않은 이유
+
+Shutdown Hook은 종료 요청을 애플리케이션에 전달할 뿐, 어떤 레코드까지 처리하고 Commit할지는 결정하지 않는다. 이번 코드는 Hook에서 `shutdownRequested=true`로 바꾸고 Consumer 실행 스레드가 끝날 때까지 기다렸다. Consumer 스레드는 다음 역할을 수행했다.
+
+```text
+SIGTERM 이후 새 레코드 처리 시작 금지
+→ 이미 processing_started인 레코드는 완료
+→ 처리한 Offset + 1 Commit
+→ Consumer Close
+```
+
+`KafkaConsumer`를 Shutdown Hook에서 직접 닫거나 Commit하지 않고 Consumer 실행 스레드가 모든 API를 호출하게 해, thread-safe하지 않은 Consumer를 두 스레드가 동시에 사용하는 상황도 피했다.
+
+#### 처리 완료와 Offset Commit 사이의 장애
+
+Auto Commit을 끄고 레코드별로 처리 완료 후 `offset + 1`을 Commit했다. 처리 중 종료에서는 이 순서가 모두 끝났으므로 재시작 시 다음 Offset부터 이어졌고 중복과 누락이 없었다.
+
+Drain 제한 시간 초과에서는 처리 결과가 이미 발생했지만 Offset은 Commit되지 않았다. Kafka는 애플리케이션의 처리 결과를 알 수 없으므로 마지막 Commit 위치에서 같은 레코드를 다시 전달했다. 이는 처리 후 Commit하는 at-least-once 방식에서 허용되는 중복이다.
+
+```text
+처리 완료 → Commit 성공 → 재시작 시 다음 Offset
+처리 완료 → Commit 전 종료 → 재시작 시 같은 Offset 재처리
+Commit 성공 → 처리 완료 전 종료 → 재처리되지 않아 유실 가능
+```
+
+따라서 Graceful Shutdown은 중복 가능성을 줄여주지만 SIGKILL, 컨테이너 강제 종료와 노드 장애까지 제거하지는 못한다. 외부 DB나 API 호출은 Event ID 기반 멱등 처리, Unique Constraint 또는 처리 이력으로 중복을 방어해야 한다.
+
+#### Drain 제한 시간의 의미
+
+`LAB_COMMIT_DELAY_MS=10000`은 10초 후 프로세스를 종료하는 설정이 아니라, 처리 완료와 Commit 사이의 장애 구간을 넓히는 실험용 지연이다. 실제 Drain 제한 시간은 SIGTERM 후 3초를 기다리고 SIGKILL한 외부 종료 절차였다.
+
+터미널의 `BUILD FAILED in 10s`는 Gradle 명령 시작부터 SIGKILL까지의 전체 실행 시간이며 애플리케이션의 종료 타이머가 아니다. 또한 Commit 지연 10초는 `max.poll.interval.ms=5000`보다 길기 때문에 그대로 실행하면 Poll Timeout도 발생할 수 있다. 이번 실행에서는 `processing_completed`부터 SIGTERM까지 약 2.116초, 이후 SIGKILL까지 약 3초가 걸려 Poll Interval 경계와 가까웠다. Consumer 로그에는 Commit 시도나 Close 완료가 없었으므로 확인된 결과는 `처리 완료 후 Commit 전 프로세스 종료와 동일 Offset 재처리`다. 이 지연값은 운영 설정이 아니라 장애 구간을 만들기 위한 실험값이다.
+
+운영 환경의 종료 유예 시간은 일반적인 in-flight 처리, Offset Commit과 Consumer Close가 끝날 수 있을 만큼 길어야 한다. 유예 시간이 끝나 SIGKILL되면 이번 실험처럼 처리됐지만 Commit되지 않은 레코드가 재전달될 수 있다.
+
+#### Rebalance와 병렬 처리에서 추가로 필요한 것
+
+이번 코드는 `max.poll.records=1`이고 한 스레드가 처리와 Commit을 순서대로 수행하므로 완료한 레코드의 다음 Offset을 바로 Commit할 수 있었다. 여러 레코드를 병렬 처리하면 나중 Offset이 먼저 끝날 수 있으므로, 가장 큰 완료 Offset을 그대로 Commit하면 아직 끝나지 않은 앞 레코드가 재전달되지 않아 유실될 수 있다.
+
+리밸런싱의 `onPartitionsRevoked()`와 프로세스 종료가 겹치는 경우에도 같은 파티션의 처리 완료 상태와 Commit을 한 곳에서 조정해야 한다. 파티션별로 연속해서 처리가 완료된 마지막 Offset까지만 Commit하고, 반납된 파티션에는 새 작업을 배정하지 않는 구조는 Lab 04에서 다룬다.
 
 ## Troubleshooting
 
