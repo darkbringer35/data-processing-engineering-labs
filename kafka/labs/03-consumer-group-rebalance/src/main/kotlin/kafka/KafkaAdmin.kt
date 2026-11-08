@@ -84,6 +84,7 @@ private fun describeConsumerGroup(admin: Admin, groupId: String) {
 
     println("consumer-group:")
     println("  groupId: ${description.groupId()}")
+    println("  type: ${description.type()}")
     println("  state: ${description.state()}")
     println("  assignor: ${description.partitionAssignor()}")
     println("  coordinator: ${coordinator.id()}@${coordinator.host()}:${coordinator.port()}")

@@ -2,6 +2,7 @@ package lab.kafka
 
 import lab.kafka.config.KafkaConfigLoader
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.consumer.CommitFailedException
 import org.apache.kafka.clients.consumer.CooperativeStickyAssignor
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
@@ -15,6 +16,7 @@ import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val COMMIT_DELAY_ENV = "LAB_COMMIT_DELAY_MS"
+private const val GROUP_PROTOCOL_ENV = "LAB_GROUP_PROTOCOL"
 
 fun main(args: Array<String>) {
     require(args.size in 1..6) {
@@ -28,13 +30,15 @@ fun main(args: Array<String>) {
     val processingDelayMs = args.getOrNull(2)?.toLongOrNull() ?: 0L
     val groupId = args.getOrNull(3) ?: config.consumer.groupId
     val assignor = args.getOrNull(4)
-    val assignmentStrategyClassName = resolveAssignmentStrategy(assignor)
     val groupInstanceId = args.getOrNull(5)
     val commitDelayMs = System.getenv(COMMIT_DELAY_ENV)?.let { input ->
         requireNotNull(input.toLongOrNull()) {
             "$COMMIT_DELAY_ENV must be an integer: $input"
         }
     } ?: 0L
+    val groupProtocol = System.getenv(GROUP_PROTOCOL_ENV)
+        ?.lowercase()
+        ?: "classic"
 
     require(groupId.isNotBlank()) {
         "Group ID must not be blank."
@@ -52,6 +56,24 @@ fun main(args: Array<String>) {
         "$COMMIT_DELAY_ENV must be zero or greater."
     }
 
+    require(groupProtocol in setOf("classic", "consumer")) {
+        "$GROUP_PROTOCOL_ENV must be classic or consumer: $groupProtocol"
+    }
+
+    val heartbeatDescription =
+        if (groupProtocol == "classic") {
+            config.consumer.heartbeatIntervalMs.toString()
+        } else {
+            "broker-controlled"
+        }
+
+    val sessionTimeoutDescription =
+        if (groupProtocol == "classic") {
+            config.consumer.sessionTimeoutMs.toString()
+        } else {
+            "broker-controlled"
+        }
+
     val props = Properties().apply {
         put("client.id", consumerId)
         put("bootstrap.servers", bootstrapServers)
@@ -59,14 +81,27 @@ fun main(args: Array<String>) {
         put("key.deserializer", config.consumer.keyDeserializer)
         put("value.deserializer", config.consumer.valueDeserializer)
         put("auto.offset.reset", config.consumer.autoOffsetReset)
-        put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, config.consumer.heartbeatIntervalMs)
-        put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, config.consumer.sessionTimeoutMs)
         put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, config.consumer.maxPollRecords)
         put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, config.consumer.maxPollIntervalMs)
         put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false)
-        assignmentStrategyClassName?.let {
-            put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, it)
+        put(ConsumerConfig.GROUP_PROTOCOL_CONFIG, groupProtocol)
+
+        when (groupProtocol) {
+            "classic" -> {
+                put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, config.consumer.heartbeatIntervalMs)
+                put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, config.consumer.sessionTimeoutMs)
+                resolveAssignmentStrategy(assignor)?.let {
+                    put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, it)
+                }
+            }
+
+            "consumer" -> {
+                resolveRemoteAssignor(assignor)?.let {
+                    put(ConsumerConfig.GROUP_REMOTE_ASSIGNOR_CONFIG, it)
+                }
+            }
         }
+
         groupInstanceId?.let {
             put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, it)
         }
@@ -91,10 +126,11 @@ fun main(args: Array<String>) {
         "consumer_started",
         "pid=$pid bootstrapServers=$bootstrapServers " +
             "groupId=$groupId " +
+            "groupProtocol=$groupProtocol " +
             "assignor=${assignor ?: "default"} " +
             "groupInstanceId=${groupInstanceId ?: "dynamic"} " +
-            "heartbeatIntervalMs=${config.consumer.heartbeatIntervalMs} " +
-            "sessionTimeoutMs=${config.consumer.sessionTimeoutMs} " +
+            "heartbeatIntervalMs=$heartbeatDescription " +
+            "sessionTimeoutMs=$sessionTimeoutDescription " +
             "maxPollRecords=${config.consumer.maxPollRecords} " +
             "maxPollIntervalMs=${config.consumer.maxPollIntervalMs} " +
             "processingDelayMs=$processingDelayMs " +
@@ -152,18 +188,27 @@ fun main(args: Array<String>) {
                     "$recordDetail nextOffset=${record.offset() + 1}"
                 )
 
-                consumer.commitSync(
-                    mapOf(
-                        TopicPartition(record.topic(), record.partition()) to
-                            OffsetAndMetadata(record.offset() + 1)
+                try {
+                    consumer.commitSync(
+                        mapOf(
+                            TopicPartition(record.topic(), record.partition()) to
+                                OffsetAndMetadata(record.offset() + 1)
+                        )
                     )
-                )
 
-                logLifecycle(
-                    consumerId,
-                    "offset_commit_completed",
-                    "$recordDetail nextOffset=${record.offset() + 1}"
-                )
+                    logLifecycle(
+                        consumerId,
+                        "offset_commit_completed",
+                        "$recordDetail nextOffset=${record.offset() + 1}"
+                    )
+                } catch (exception: CommitFailedException) {
+                    logLifecycle(
+                        consumerId,
+                        "offset_commit_failed",
+                        "$recordDetail nextOffset=${record.offset() + 1} " +
+                            "exception=${exception.javaClass.simpleName} reason=${exception.message}"
+                    )
+                }
             }
         }
     } finally {
@@ -186,13 +231,26 @@ private fun logLifecycle(consumerId: String, event: String, detail: String? = nu
 private fun resolveAssignmentStrategy(assignor: String?): String? {
     return when (assignor) {
         null -> null
+        "uniform" -> "uniform"
         "range" -> RangeAssignor::class.java.name
         "roundrobin" -> RoundRobinAssignor::class.java.name
         "sticky" -> StickyAssignor::class.java.name
         "cooperative-sticky" -> CooperativeStickyAssignor::class.java.name
         else -> error(
             "Unknown assignor: $assignor. " +
-                "Supported assignors: range, roundrobin, sticky, cooperative-sticky"
+                "Supported assignors: uniform, range, roundrobin, sticky, cooperative-sticky"
+        )
+    }
+}
+
+private fun resolveRemoteAssignor(assignor: String?): String? {
+    return when (assignor) {
+        null -> null
+        "uniform" -> "uniform"
+        "range" -> "range"
+        else -> error(
+            "Unknown remote assignor: $assignor. " +
+                "Supported remote assignors: uniform, range"
         )
     }
 }

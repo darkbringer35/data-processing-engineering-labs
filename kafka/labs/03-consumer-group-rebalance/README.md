@@ -1911,6 +1911,380 @@ Commit 성공 → 처리 완료 전 종료 → 재처리되지 않아 유실 가
 
 리밸런싱의 `onPartitionsRevoked()`와 프로세스 종료가 겹치는 경우에도 같은 파티션의 처리 완료 상태와 Commit을 한 곳에서 조정해야 한다. 파티션별로 연속해서 처리가 완료된 마지막 Offset까지만 Commit하고, 반납된 파티션에는 새 작업을 배정하지 않는 구조는 Lab 04에서 다룬다.
 
+## Experiment 10. Classic and Consumer Group Protocol Comparison
+
+### 목적
+
+- Kafka 3.9에서 Classic과 Consumer Group Protocol을 같은 토픽, 파티션 수와 Range Assignor로 실행한다.
+- c2 참가와 강제 종료 때 실제로 소유자가 바뀐 파티션 수와 c1의 반납·할당 콜백 범위를 구분한다.
+- 파티션 할당, Heartbeat와 Session Timeout 설정의 책임이 Client와 Broker 중 어디에 있는지 확인한다.
+
+### 명령어
+
+Broker와 Client는 모두 Kafka 3.9.0을 사용했다. Consumer Protocol을 활성화하고 Broker가 관리하는 Heartbeat와 Session Timeout을 2초와 15초로 설정했다.
+
+```yaml
+KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: "classic,consumer"
+KAFKA_GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS: 2000
+KAFKA_GROUP_CONSUMER_MIN_HEARTBEAT_INTERVAL_MS: 1000
+KAFKA_GROUP_CONSUMER_SESSION_TIMEOUT_MS: 15000
+KAFKA_GROUP_CONSUMER_MIN_SESSION_TIMEOUT_MS: 6000
+```
+
+Broker에 적용된 정적 설정과 출처를 조회했다.
+
+```bash
+docker exec lab03-kafka \
+  /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type brokers \
+  --entity-name 1 \
+  --describe \
+  --all \
+  | grep -E 'group\.(coordinator\.rebalance\.protocols|consumer\.(heartbeat|session|min))'
+```
+
+Compose를 새로 시작한 뒤 Producer보다 먼저 6개 파티션 토픽을 생성했다. Producer를 먼저 실행하면 `KAFKA_NUM_PARTITIONS=1`에 따라 토픽이 1개 파티션으로 자동 생성될 수 있으므로 순서를 고정했다.
+
+```bash
+docker compose down
+docker compose up -d
+./gradlew runAdmin --args="create-topic 6"
+./gradlew runAdmin --args="describe-topic"
+
+./gradlew runProducer --args="continuous" \
+  2>&1 | tee /tmp/lab03-ex10-producer.log
+```
+
+#### Classic Protocol
+
+Classic에서는 `LAB_GROUP_PROTOCOL=classic`과 Client의 `partition.assignment.strategy`에 해당하는 `range`를 사용했다.
+
+```bash
+LAB_GROUP_PROTOCOL=classic ./gradlew runConsumer \
+  --args="classic-c1 localhost:9092 0 ex10-classic range" \
+  2>&1 | tee /tmp/lab03-ex10-classic-c1.log
+
+LAB_GROUP_PROTOCOL=classic ./gradlew runConsumer \
+  --args="classic-c2 localhost:9092 0 ex10-classic range" \
+  2>&1 | tee /tmp/lab03-ex10-classic-c2.log
+
+./gradlew runAdmin --args="describe-group ex10-classic" \
+  | tee /tmp/lab03-ex10-classic-after-join.log
+```
+
+c2의 시작 로그에 출력된 Consumer JVM PID에 SIGKILL을 보내고, Session Timeout 이후 그룹을 다시 조회했다.
+
+```bash
+date -u '+%Y-%m-%dT%H:%M:%SZ'
+kill -9 <classic-c2-pid>
+
+./gradlew runAdmin --args="describe-group ex10-classic" \
+  | tee /tmp/lab03-ex10-classic-after-failure.log
+
+grep -E 'event=(consumer_started|partitions_revoked|partitions_assigned)' \
+  /tmp/lab03-ex10-classic-c1.log \
+  /tmp/lab03-ex10-classic-c2.log \
+  | tee /tmp/lab03-ex10-classic-rebalance-events.log
+```
+
+#### Consumer Protocol
+
+Consumer에서는 `LAB_GROUP_PROTOCOL=consumer`를 사용했다. 같은 이름의 `range`는 Client Class가 아니라 Broker의 `group.remote.assignor`로 전달된다. 예외가 표준 오류로 출력되는 경우도 보존하도록 `2>&1`을 사용했다.
+
+```bash
+LAB_GROUP_PROTOCOL=consumer ./gradlew runConsumer \
+  --args="consumer-c1 localhost:9092 0 ex10-consumer range" \
+  2>&1 | tee /tmp/lab03-ex10-consumer-c1.log
+
+LAB_GROUP_PROTOCOL=consumer ./gradlew runConsumer \
+  --args="consumer-c2 localhost:9092 0 ex10-consumer range" \
+  2>&1 | tee /tmp/lab03-ex10-consumer-c2.log
+
+./gradlew runAdmin --args="describe-group ex10-consumer" \
+  | tee /tmp/lab03-ex10-consumer-after-join.log
+```
+
+Classic과 같은 방식으로 c2를 강제 종료하고, 그룹과 리밸런싱 이벤트를 저장했다. Consumer Protocol에서 발견한 Commit 실패도 함께 추출했다.
+
+```bash
+date -u '+%Y-%m-%dT%H:%M:%SZ'
+kill -9 <consumer-c2-pid>
+
+./gradlew runAdmin --args="describe-group ex10-consumer" \
+  | tee /tmp/lab03-ex10-consumer-after-failure.log
+
+grep -E 'event=(consumer_started|partitions_revoked|partitions_assigned|offset_commit_failed)' \
+  /tmp/lab03-ex10-consumer-c1.log \
+  /tmp/lab03-ex10-consumer-c2.log \
+  | tee /tmp/lab03-ex10-consumer-rebalance-events.log
+```
+
+### 실제 출력
+
+#### 1. Broker 설정
+
+`classic,consumer`가 `STATIC_BROKER_CONFIG`로 적용됐다. Consumer Protocol의 Heartbeat는 2초, Session Timeout은 15초였다.
+
+```text
+group.consumer.heartbeat.interval.ms=2000
+group.consumer.min.heartbeat.interval.ms=1000
+group.consumer.session.timeout.ms=15000
+group.consumer.min.session.timeout.ms=6000
+group.coordinator.rebalance.protocols=classic,consumer
+```
+
+![Classic과 Consumer Protocol을 활성화한 Broker 설정](images/ex10-broker-consumer-protocol-config.png)
+
+#### 2. Classic Protocol
+
+c2 참가 후 그룹은 `type=Classic`, `assignor=range`와 두 멤버로 안정화됐다. c1은 파티션 0~2, c2는 3~5를 소유했다.
+
+![Classic Protocol의 두 멤버 파티션 할당](images/ex10-classic-group-two-members.png)
+
+최종 할당은 3개씩이었지만 c1은 이동하지 않을 파티션 0~2를 포함해 기존 6개를 모두 반납한 뒤 0~2를 다시 할당받았다.
+
+```text
+15:47:46.744674 c2 consumer_started
+15:47:47.308743 c1 partitions_revoked  [0, 1, 2, 3, 4, 5]
+15:47:47.327048 c1 partitions_assigned [0, 1, 2]
+15:47:47.330977 c2 partitions_assigned [3, 4, 5]
+```
+
+c2 장애 후에도 c1은 기존 0~2를 반납한 뒤 0~5를 다시 할당받았다.
+
+```text
+15:49:48.831899 c1 partitions_revoked  [0, 1, 2]
+15:49:48.853271 c1 partitions_assigned [0, 1, 2, 3, 4, 5]
+```
+
+![Classic c2 장애 후 c1의 전체 파티션 할당](images/ex10-classic-group-after-c2-failure.png)
+
+![Classic Protocol의 참가 및 장애 복구 콜백](images/ex10-classic-rebalance-events.png)
+
+#### 3. Consumer Protocol
+
+c2 참가 후 그룹은 `type=Consumer`, `assignor=range`와 두 멤버로 안정화됐고 최종 할당은 Classic과 같았다.
+
+![Consumer Protocol의 두 멤버 파티션 할당](images/ex10-consumer-group-two-members.png)
+
+Consumer Protocol에서 c1은 c2로 이동할 파티션 3~5만 반납했다. `partitions_assigned partitions=`는 c1의 전체 할당이 비었다는 뜻이 아니라 새로 추가된 파티션이 없다는 콜백이다. c1은 파티션 0~2를 계속 유지했다.
+
+```text
+06:14:52.076082 c2 consumer_started
+06:14:53.140099 c2 partitions_assigned []
+06:14:54.322116 c1 partitions_revoked  [3, 4, 5]
+06:14:54.339537 c1 partitions_assigned []
+06:14:56.149661 c2 partitions_assigned [3, 4, 5]
+```
+
+c2 장애 후에는 c1이 기존 0~2를 반납하지 않고 3~5만 추가로 할당받았다.
+
+```text
+06:16:08.402139 c1 partitions_assigned [3, 4, 5]
+```
+
+![Consumer c2 장애 후 c1의 전체 파티션 할당](images/ex10-consumer-group-after-c2-failure.png)
+
+멤버 변경 시 c1의 Member Epoch가 바뀌는 시점과 `commitSync()`가 겹쳐 `stale member epoch` 오류가 두 번 발생했다. 수정 전에는 이 예외로 c1이 종료됐지만, 수정 후에는 `offset_commit_failed`를 기록하고 다음 `poll()`에서 새 Epoch와 할당을 반영했다. 두 번 모두 c1은 그룹에 남았다.
+
+```text
+06:14:54.359956 offset_commit_failed partition=2 offset=888
+CommitFailedException: OffsetCommit failed with stale member epoch
+
+06:16:08.402018 offset_commit_failed partition=1 offset=576
+06:16:08.402139 partitions_assigned [3, 4, 5]
+```
+
+![Consumer Protocol의 점진적 할당과 Commit 실패 처리](images/ex10-consumer-rebalance-and-commit-failure-events.png)
+
+### 결과
+
+증설 시간은 c2의 `consumer_started`부터 파티션 3~5를 할당받은 시점까지 계산했다. 장애 복구 시간은 SIGKILL 시각을 저장하지 못해 c2의 마지막 처리 로그부터 c1의 추가 할당까지를 사용했다. 따라서 증설 시간은 실측값, 장애 복구 시간은 근사값이다.
+
+| Protocol | 할당 계산 주체 | c2 할당 완료 | 장애 복구 | 소유자가 바뀐 파티션 | c1의 동작 |
+|---|---|---:|---:|---:|---|
+| Classic | Consumer Group Leader의 Client Assignor | 약 0.586초 | 약 15.02초 | 참가 3개 / 장애 3개 | 유지할 파티션까지 모두 반납 |
+| Consumer | Broker Group Coordinator의 Remote Assignor | 약 4.074초 | 약 15.73초 | 참가 3개 / 장애 3개 | 이동할 파티션만 반납 |
+
+두 Protocol 모두 실제 소유자가 바뀐 파티션은 3개였다. 차이는 계속 실행 중인 c1의 콜백 범위에서 나타났다.
+
+| 사건 | Classic c1 | Consumer c1 | 실제 소유자 변경 |
+|---|---|---|---:|
+| c2 참가 | 0~5 반납 후 0~2 재할당 | 3~5만 반납, 0~2 유지 | 3개 |
+| c2 장애 | 0~2 반납 후 0~5 재할당 | 기존 파티션 반납 없이 3~5 추가 | 3개 |
+
+### 해석 및 궁금증
+
+#### Classic과 Consumer가 바꾸는 것
+
+Classic과 Consumer는 모두 파티션 하나를 그룹 멤버 하나가 소유하고, Commit된 Offset부터 처리를 이어가는 Consumer Group이다. 차이는 누가 할당을 계산하고 멤버들이 새 할당으로 어떻게 전환하는지에 있다.
+
+| 비교 기준 | Classic Protocol | Consumer Protocol |
+|---|---|---|
+| Group Coordinator | Broker 중 하나 | Broker 중 하나 |
+| 할당 계산 | Group Leader로 선정된 Consumer가 Client Assignor 실행 | Group Coordinator가 Remote Assignor 실행 |
+| 멤버 변경 | 모든 멤버가 `JoinGroup`과 `SyncGroup`에 참여 | 각 멤버가 `ConsumerGroupHeartbeat`로 목표 할당에 수렴 |
+| 상태 식별 | Group Generation과 Member ID | Group Epoch, Member Epoch와 Target Assignment |
+| 할당 전환 | Assignor가 지원하는 Eager 또는 Cooperative 방식 | 현재 할당과 목표 할당의 차이를 점진적으로 반영 |
+| Assignor 설정 | `partition.assignment.strategy`에 Client Class 지정 | `group.remote.assignor`에 Broker Assignor 이름 지정 |
+| Heartbeat·Session 설정 | Client별 설정 | Broker의 `group.consumer.*` 설정 |
+| 이번 Range 결과 | c1이 6개를 반납한 뒤 3개 재할당 | c1이 3개만 반납하고 나머지 3개 유지 |
+| Kafka 3.9 지원 수준 | 기존 운영 Protocol | Early Access |
+
+Classic의 Group Leader는 레코드 처리를 지휘하지 않는다. Group Coordinator가 멤버 하나를 할당 계산용 Leader로 정하면, 해당 Consumer가 전체 구독 정보를 받아 Assignor를 실행하고 결과를 Broker에 돌려준다.
+
+```text
+Classic
+멤버 변경
+→ 모든 멤버가 JoinGroup
+→ 선정된 Group Leader가 할당 계산
+→ SyncGroup으로 결과 배포
+→ 각 멤버가 새 할당 적용
+```
+
+Consumer Protocol에는 할당 계산용 Client Leader가 없다. Broker가 목표 할당을 계산하고 각 멤버는 Heartbeat 응답을 받아 현재 할당과의 차이를 반영한다. 멤버별로 필요한 변경만 수행하므로 수렴 시점과 Member Epoch도 서로 다를 수 있다.
+
+```text
+Consumer
+멤버 변경
+→ Broker가 Target Assignment 계산
+→ 각 멤버가 ConsumerGroupHeartbeat로 목표 확인
+→ 이동할 파티션만 반납·획득
+→ 모든 멤버가 각자의 목표 할당으로 수렴
+```
+
+Consumer Protocol은 `더 빠른 리밸런싱` 하나로 설명할 기능이 아니다. 할당 계산과 시간 설정을 Broker로 모으고, 전체 멤버를 한 번에 전환하는 대신 각 멤버가 필요한 변경만 수행하도록 제어 구조를 바꾼 것이다.
+
+#### 최종 할당이 같아도 처리 영향은 다르다
+
+c2 참가 후 최종 할당은 모두 c1 0~2, c2 3~5였다. 실제로 이동한 파티션도 3~5의 3개로 같았지만, c1이 리밸런싱 중 반납한 범위는 달랐다.
+
+| 관찰값 | Classic + Range | Consumer + Range |
+|---|---|---|
+| c1의 최종 할당 | 0, 1, 2 | 0, 1, 2 |
+| c2의 최종 할당 | 3, 4, 5 | 3, 4, 5 |
+| 실제 소유자가 바뀐 파티션 | 3, 4, 5 | 3, 4, 5 |
+| c1이 반납한 파티션 | 0, 1, 2, 3, 4, 5 | 3, 4, 5 |
+| c1이 반납하지 않고 유지한 파티션 | 없음 | 0, 1, 2 |
+
+Classic + Range에서는 c1이 6개를 모두 반납하고 0~2를 다시 받았다. 소유자가 바뀌지 않은 0~2도 콜백, 캐시 정리와 파티션별 상태 재초기화 대상이 될 수 있다. Consumer + Range에서는 이동할 3~5만 반납해 0~2의 처리를 유지했다.
+
+따라서 운영 영향을 판단할 때는 `실제로 소유자가 바뀐 파티션 수`만 보면 부족하다. 다음 세 가지를 함께 확인해야 한다.
+
+- 실제 소유자가 바뀐 파티션은 몇 개인가?
+- 반납 콜백에는 몇 개의 파티션이 포함됐는가?
+- 기존 컨슈머가 반납하지 않고 유지한 파티션은 몇 개인가?
+
+이번 결과는 `Classic + Range`와 `Consumer + Range`의 차이다. 할당 계산 방식과 할당 전환 방식은 별도 축이므로 Protocol 차이만으로 일반화하지 않는다.
+
+| 구성 | 목표 할당 계산 | 목표 할당으로 전환 |
+|---|---|---|
+| Classic + Range | Range | Eager: 기존 할당 전체 반납 |
+| Classic + CooperativeSticky | Sticky | Cooperative: 이동 대상만 반납 |
+| Consumer + Range | Broker의 Range | Protocol이 현재 할당과의 차이만 반영 |
+
+Classic에서도 Experiment 7의 `CooperativeStickyAssignor`를 사용하면 이동 대상만 반납할 수 있다. `RangeAssignor`는 기본 `EAGER`, `CooperativeStickyAssignor`는 `COOPERATIVE` 방식을 선언한다([KIP-429](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/103090108/KIP-429%2BKafka%2BConsumer%2BIncremental%2BRebalance%2BProtocol), [Kafka 3.9 소스](https://github.com/apache/kafka/blob/3.9.0/clients/src/main/java/org/apache/kafka/clients/consumer/CooperativeStickyAssignor.java)). Consumer Protocol의 `range`는 목표 할당만 계산하고 Broker가 안전한 인계 순서를 조정한다([KIP-848](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848%2BThe%2BNext%2BGeneration%2Bof%2Bthe%2BConsumer%2BRebalance%2BProtocol)).
+
+#### 설정과 할당 책임의 이동
+
+Classic에서는 각 Client가 `partition.assignment.strategy`, `heartbeat.interval.ms`, `session.timeout.ms`를 설정한다. Consumer Protocol에서는 Broker가 Remote Assignor와 `group.consumer.*` 값을 관리한다. Client별 설정 편차는 줄어들지만 변경 단위가 Broker로 커지므로, 전환할 때는 Assignor와 Timeout을 Broker 운영 설정으로 함께 관리해야 한다.
+
+#### Member Epoch와 Offset Commit
+
+Consumer Protocol은 점진적으로 할당을 바꾸는 동안에도 c1이 유지 중인 파티션을 계속 처리했다. 이때 Member Epoch가 먼저 갱신됐고, 이전 Epoch로 보낸 Offset Commit을 Broker가 `stale member epoch`로 거절했다.
+
+수정 전 처리 루프는 Classic 실험을 거치며 다음 순서를 전제로 작성됐다.
+
+```text
+poll()에서 레코드 획득
+→ 레코드 처리
+→ 같은 그룹 상태에서 commitSync() 성공
+→ 다음 poll()
+```
+
+기존 코드는 `poll()`과 `commitSync()` 사이에 그룹 상태가 유지된다고 가정했다. Consumer Protocol은 Background Heartbeat로 Target Assignment와 Member Epoch를 갱신하므로 애플리케이션 처리 중에도 이 가정이 깨질 수 있다. Kafka가 KIP-848을 구현하면서 공개 API는 유지하되 내부를 `LegacyKafkaConsumer`와 `AsyncKafkaConsumer`로 분리한 이유도 여기에 있다([KIP-848](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848%2BThe%2BNext%2BGeneration%2Bof%2Bthe%2BConsumer%2BRebalance%2BProtocol), [KAFKA-15277](https://github.com/apache/kafka/commit/22f7ffe5e1623d279096b45ab475768eeb05eee1)).
+
+수정한 코드는 `CommitFailedException`을 잡아 실패한 파티션과 Offset을 남기고 다음 `poll()`에서 최신 그룹 상태를 반영한다. 실패한 Offset은 Commit되지 않았으므로 중복 처리를 허용하고 비즈니스 로직을 멱등하게 만드는 것이 안전하다. 이 예외는 Classic에서도 리밸런싱과 Commit이 겹치면 발생할 수 있으므로 Protocol별 임시 대응이 아니라 공통 Commit 실패 경로로 관리한다.
+
+#### 예상과 실제 증설 시간의 차이
+
+전체 동기화 장벽이 사라지면 c2 증설도 더 빨라질 것으로 예상했지만, 이번 실행에서는 Consumer Protocol이 더 오래 걸렸다. Consumer Protocol의 우선 목표는 모든 인계를 단축하는 것이 아니라, 할당이 바뀌지 않는 멤버의 처리를 유지하고 큰 그룹에서 전체 멤버를 기다리는 비용을 없애는 데 있다([KIP-848](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848%2BThe%2BNext%2BGeneration%2Bof%2Bthe%2BConsumer%2BRebalance%2BProtocol)).
+
+| Protocol | c2 시작부터 최종 파티션 할당까지 |
+|---|---:|
+| Classic + Range | 약 0.586초 |
+| Consumer + Range | 약 4.074초 |
+
+Classic + Range는 c1의 전체 파티션을 반납한 뒤 새 할당을 한 번에 적용해 작은 그룹에서는 빠르게 끝날 수 있지만 처리 영향 범위가 컸다. Consumer + Range는 중복 소유를 막기 위해 c1의 반납을 확인한 뒤 c2에 파티션을 넘겼다.
+
+```text
+06:14:52.076 c2 시작
+06:14:53.140 c2가 빈 할당 수신
+06:14:54.322 c1이 파티션 3~5 반납
+06:14:56.149 c2가 파티션 3~5 획득
+```
+
+Consumer Protocol의 Heartbeat Interval은 2초였다. 안정 상태의 멤버는 주기에 맞춰 Heartbeat를 보내고, 반납을 마친 멤버는 즉시 확인 Heartbeat를 보낸다([Kafka 3.9 소스](https://github.com/apache/kafka/blob/3.9.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/HeartbeatRequestManager.java)). 약 4초는 `c2 참가 → c1 반납 → c2 획득`이 여러 Heartbeat에 걸쳐 진행된 결과와 맞는다.
+
+이번 실행에서는 Consumer Protocol의 할당 수렴이 느렸지만 c1의 파티션 0~2 처리는 유지됐다. 따라서 속도와 영향 범위를 분리해 기록한다. 성능 비교는 Experiment 11에서 시작 시각을 정확히 저장하고 같은 조건을 반복해 p50과 p95로 검증한다.
+
+장애 복구는 Classic 약 15.02초, Consumer 약 15.73초로 모두 15초 Session Timeout의 지배를 받았다. SIGKILL 시각 대신 c2의 마지막 처리 시각을 사용했으므로 0.71초 차이는 비교 대상에서 제외한다.
+
+#### Migration 판단
+
+Consumer Protocol은 Broker 중심 설정과 점진적 파티션 인계가 필요한 환경에서 선택할 수 있다. 다만 Kafka 3.9 구현은 Early Access이므로 학습과 호환성 검증에만 사용한다. 운영 전환 전에는 다음 항목을 통과시킨다.
+
+- Broker와 Client Version의 지원 범위
+- Remote Assignor가 만드는 실제 할당과 이동량
+- `group.consumer.*` Timeout과 Heartbeat 값
+- Commit 실패 처리와 중복 처리 멱등성
+- 리밸런싱 시간, 영향받은 파티션 수와 실패 메트릭
+
+#### 보충: Share Group을 제외한 이유
+
+Share Group은 Consumer Group의 리밸런싱 Protocol이 아니라 별도의 소비 모델이다. Ex10은 같은 파티션 소유 모델에서 Classic과 Consumer의 제어 구조를 비교하는 실험이므로 Share Group은 실행 대상에서 제외했다.
+
+세 기능의 가장 큰 개념 차이는 분배 단위다.
+
+| 비교 기준 | Classic | Consumer | Share Group |
+|---|---|---|---|
+| 소비 모델 | 일반 Consumer Group | 일반 Consumer Group | Shared Subscription |
+| 분배 단위 | 파티션 소유권 | 파티션 소유권 | 레코드 |
+| 같은 파티션의 동시 처리 | 그룹 안에서 한 멤버 | 그룹 안에서 한 멤버 | 여러 멤버가 레코드를 나눠 처리 가능 |
+| 처리 진행 상태 | Commit된 다음 Offset | Commit된 다음 Offset | 레코드별 Acknowledge와 Delivery 상태 |
+| 순서 특성 | 파티션 순서 유지 가능 | 파티션 순서 유지 가능 | 같은 파티션의 병렬 처리로 순서가 약해질 수 있음 |
+| Client API | `KafkaConsumer` | `KafkaConsumer` | `KafkaShareConsumer` |
+| 적합한 문제 | 파티션 단위 순서와 상태 소유 | Broker 중심의 점진적 파티션 재할당 | 파티션 수를 넘는 Worker 확장과 레코드별 재처리 제어 |
+
+Classic에서 Consumer로 전환하면 같은 Consumer Group의 제어 방식이 바뀐다. Share Group을 도입하면 소비 단위 자체가 파티션 소유권에서 레코드 획득과 Acknowledge로 바뀐다.
+
+현재 코드로 Share Group을 실행하려면 두 가지 작업이 필요하다.
+
+- Broker의 `group.coordinator.rebalance.protocols`에 `share`를 추가하고 컨테이너를 다시 생성해야 한다.
+- 현재 `KafkaConsumer` 기반 `OrderEventConsumer`와 분리된 `KafkaShareConsumer` 실행 코드를 구현해야 한다.
+
+Kafka 3.9의 `KafkaShareConsumer`도 Early Access다. Ex10에 억지로 포함하지 않고 별도 실험에서 레코드 분배와 재전달 동작을 검증하는 편이 목적에 맞다.
+
+처리 결과도 다음 Offset을 Commit하는 방식이 아니라 각 레코드의 전달 결과를 확인하는 방식으로 표현한다.
+
+| Acknowledge Type | 의미 |
+|---|---|
+| `ACCEPT` | 처리를 완료했으며 다시 전달할 필요가 없다. |
+| `RELEASE` | 일시적인 실패이므로 다시 전달할 수 있다. |
+| `REJECT` | 영구 실패로 판단해 이후 전달 대상에서 제외한다. |
+
+Share Consumer의 `commitSync()`는 일반 Consumer처럼 파티션의 다음 Offset만 저장하는 것이 아니라, 레코드별 Acknowledge 결과를 Broker에 반영한다. 획득한 레코드에는 일정 시간 동안 다른 멤버에게 전달되지 않도록 Record Lock도 적용된다.
+
+Share Group 실험에서는 다음 항목을 직접 확인한다.
+
+- 같은 파티션의 레코드를 여러 Share Consumer가 실제로 나눠 처리하는지
+- `ACCEPT`, `RELEASE`, `REJECT`에 따라 재전달 여부가 어떻게 달라지는지
+- Consumer 장애와 Record Lock 만료 뒤 어느 레코드가 다시 전달되는지
+- 처리 병렬성이 증가하는 대신 파티션 내 순서가 어떻게 달라지는지
+
+참고: [Kafka 3.9 Broker 설정](https://kafka.apache.org/39/configuration/broker-configs/), [KafkaShareConsumer API](https://kafka.apache.org/39/javadoc/org/apache/kafka/clients/consumer/KafkaShareConsumer.html)
+
 ## Troubleshooting
 
 ### `createTopics()`를 호출해도 중복 생성이 모두 성공한 것처럼 보임
@@ -1945,3 +2319,11 @@ Commit 성공 → 처리 완료 전 종료 → 재처리되지 않아 유실 가
 - 해결: c1, Producer와 AdminClient는 `localhost:9092`의 `DIRECT` listener를 사용하고, c2만 `localhost:29092`의 Toxiproxy를 사용한다. Kafka의 광고 주소는 `PROXY://localhost:29092`, Proxy의 `upstream`은 Compose service 이름을 사용한 `kafka:29093`으로 설정한다.
 - 확인: c1 시작 로그의 `bootstrapServers`는 `localhost:9092`, c2는 `localhost:29092`인지 확인한다. Proxy 비활성화 후에는 c2 프로세스가 살아 있지만 c1이 6개 파티션을 다시 할당받아야 하며, Proxy 복구 후에는 c2가 그룹에 재가입해야 한다.
 - 재발 방지: Toxiproxy 제어 API `8474`와 c2 접속 Port `29092`는 `127.0.0.1`에만 bind한다. `depends_on`은 시작 순서만 보장하므로 Topic 생성이 실패하면 `docker compose ps`와 `docker compose logs kafka`로 Kafka 준비 상태를 확인한다.
+
+### Experiment 10에서 Consumer Protocol 전환 후 Commit 실패로 c1이 종료됨
+
+- 증상: Consumer Protocol의 c1에 6개 파티션이 할당된 상태에서 c2를 실행하자, c1이 일부 파티션을 반납한 직후 종료됐다. Gradle은 `runConsumer FAILED`로 끝났고, 남은 c2가 6개 파티션을 모두 할당받았다.
+- 원인: Consumer Protocol은 Background Heartbeat와 Member Epoch로 그룹 상태를 갱신한다. c1이 이전 Epoch로 `commitSync()`를 호출하자 Kafka가 `CommitFailedException: OffsetCommit failed with stale member epoch`를 반환했고, 처리되지 않은 예외가 프로세스를 종료시켰다. Kafka 3.9도 일반 `commitSync()`의 Stale Member Epoch를 자동 재시도하지 않도록 구현돼 있다([KAFKA-16033](https://github.com/apache/kafka/commit/77ba06fa620ad9cc42af92f42354661308676135)).
+- 해결: `CommitFailedException`을 잡아 `offset_commit_failed`, 파티션과 Offset을 남긴 뒤 다음 `poll()`에서 최신 그룹 상태를 반영했다. 같은 Epoch에서 즉시 재시도하거나 실패한 Commit을 성공으로 기록하지 않았다.
+- 확인: 같은 조건에서 `stale member epoch`가 다시 발생해도 c1은 종료되지 않았다. 그룹은 `Stable`, `memberCount=2`, `assignor=range`로 복구됐고 c1은 0~2, c2는 3~5를 처리했다.
+- 재발 방지: 모든 Protocol에서 `CommitFailedException`을 정상적인 실패 경로로 처리하고 중복 처리에 대비해 비즈니스 로직을 멱등하게 만든다. `2>&1 | tee`로 표준 오류를 보존하고 Commit 실패 횟수를 모니터링한다.
